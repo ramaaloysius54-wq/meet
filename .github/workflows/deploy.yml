@@ -82,24 +82,48 @@ jobs:
             set -e
             export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-            # 1. Pastikan Project & Application ArgoCD terdaftar + Auto-Sync aktif
-            kubectl apply -f /var/www/ramameet/k8s/project.yaml
-            kubectl apply -f /var/www/ramameet/k8s/application.yaml
-            kubectl patch application ramameet-prod -n argocd --type merge \
-              -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' || true
+            # 1. Pastikan namespace ramameet selalu ada
+            kubectl create namespace ramameet --dry-run=client -o yaml | kubectl apply -f -
 
-            # 2. Paksa ArgoCD menarik perubahan manifest terbaru dari Git (folder k8s/)
+            # 2. Apply Project & Application ArgoCD (mendukung folder k8s/argocd/ maupun k8s/)
+            if [ -f /var/www/ramameet/k8s/argocd/project.yaml ]; then
+              kubectl apply -f /var/www/ramameet/k8s/argocd/project.yaml
+            elif [ -f /var/www/ramameet/k8s/project.yaml ]; then
+              kubectl apply -f /var/www/ramameet/k8s/project.yaml
+            fi
+
+            if [ -f /var/www/ramameet/k8s/argocd/application.yaml ]; then
+              kubectl apply -f /var/www/ramameet/k8s/argocd/application.yaml
+            elif [ -f /var/www/ramameet/k8s/application.yaml ]; then
+              kubectl apply -f /var/www/ramameet/k8s/application.yaml
+            fi
+
+            kubectl patch application ramameet-prod -n argocd --type merge \
+              -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true},"syncOptions":["CreateNamespace=true"]}}}' || true
+
+            # 3. Paksa ArgoCD menarik perubahan manifest terbaru dari Git
             kubectl annotate application ramameet-prod -n argocd \
               argocd.argoproj.io/refresh="hard" --overwrite || true
 
-            # 3. Rollout restart agar K3s menarik Docker image :latest terbaru dari GHCR
-            kubectl rollout restart deployment/ramameet-web -n ramameet
-            kubectl rollout restart deployment/ramameet-signaling -n ramameet
+            # 4. Jika deployment belum terbuat oleh ArgoCD, apply manifest workload langsung
+            if ! kubectl get deployment ramameet-web -n ramameet >/dev/null 2>&1; then
+              find /var/www/ramameet/k8s -maxdepth 2 -type f \( -name "*.yaml" -o -name "*.yml" \) \
+                ! -path "*/argocd/*" ! -name "project.yaml" ! -name "application.yaml" \
+                -exec kubectl apply -f {} \;
+            fi
 
-            kubectl rollout status deployment/ramameet-web -n ramameet --timeout=120s
-            kubectl rollout status deployment/ramameet-signaling -n ramameet --timeout=120s
+            # 5. Rollout restart agar K3s menarik Docker image :latest terbaru dari GHCR
+            if kubectl get deployment ramameet-web -n ramameet >/dev/null 2>&1; then
+              kubectl rollout restart deployment/ramameet-web -n ramameet
+              kubectl rollout status deployment/ramameet-web -n ramameet --timeout=120s
+            fi
 
-            # 4. Cek status akhir ArgoCD & Pods
-            kubectl get applications -n argocd
+            if kubectl get deployment ramameet-signaling -n ramameet >/dev/null 2>&1; then
+              kubectl rollout restart deployment/ramameet-signaling -n ramameet
+              kubectl rollout status deployment/ramameet-signaling -n ramameet --timeout=120s
+            fi
+
+            # 6. Cek status akhir ArgoCD & Pods
+            kubectl get applications -n argocd || true
             kubectl get pods -n ramameet -o wide
           ENDK8S
