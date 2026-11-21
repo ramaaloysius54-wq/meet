@@ -1,0 +1,7 @@
+node_modules
+.next
+server/node_modules
+server/dist
+.git
+.env
+k8s

@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ramameet-signaling
+  namespace: ramameet
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ramameet-signaling
+  template:
+    metadata:
+      labels:
+        app: ramameet-signaling
+    spec:
+      containers:
+        - name: signaling
+          image: ghcr.io/YOUR_ORG/ramameet:latest
+          command: ["node", "signaling/dist/index.js"]
+          ports:
+            - containerPort: 4000
+          envFrom:
+            - configMapRef:
+                name: ramameet-config
+            - secretRef:
+                name: ramameet-secrets
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ramameet-signaling
+  namespace: ramameet
+spec:
+  selector:
+    app: ramameet-signaling
+  ports:
+    - port: 4000
+      targetPort: 4000

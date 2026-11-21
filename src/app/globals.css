@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background-color: #0F172A;
+  color: #F8FAFC;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overflow-x: hidden;
+}
+
+/* Custom subtle dark scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #263858;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3B527A;
+}
+
+.upgrade-card-bg {
+  background:
+    radial-gradient(circle at 20% 20%, rgba(56, 189, 248, 0.45) 0%, transparent 55%),
+    radial-gradient(circle at 85% 85%, rgba(37, 99, 235, 0.65) 0%, transparent 60%),
+    linear-gradient(155deg, #1677FF 0%, #172554 62%, #0F172A 100%);
+}
+
+.glass-pill {
+  background: rgba(10, 16, 30, 0.68);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}

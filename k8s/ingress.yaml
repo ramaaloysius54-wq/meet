@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ramameet-ingress
+  namespace: ramameet
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - meet.yourdomain.com
+      secretName: ramameet-tls
+  rules:
+    - host: meet.yourdomain.com
+      http:
+        paths:
+          - path: /socket.io
+            pathType: Prefix
+            backend:
+              service:
+                name: ramameet-signaling
+                port:
+                  number: 4000
+          - path: /rtc
+            pathType: Prefix
+            backend:
+              service:
+                name: ramameet-livekit
+                port:
+                  number: 7880
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ramameet-web
+                port:
+                  number: 80
