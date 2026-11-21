@@ -385,7 +385,7 @@ export function useLiveKitRoom({
   const replaceMeshRoleTrack = useCallback(
     async (role: "audio" | "camera" | "screen", nextTrack: MediaStreamTrack | null) => {
       const session = getSession(sessionKey);
-      for (const pc of session.peerConnections.values()) {
+      for (const pc of Array.from(session.peerConnections.values())) {
         const transceiver = getTransceiverByRole(pc, role);
         if (transceiver?.sender) {
           await transceiver.sender.replaceTrack(nextTrack).catch(() => {});
@@ -403,7 +403,9 @@ export function useLiveKitRoom({
       if (session.room) {
         const camPub = session.room.localParticipant.getTrackPublication(Track.Source.Camera);
         if (camPub?.track) {
-          await session.room.localParticipant.unpublishTrack(camPub.track, false).catch(() => {});
+          await Promise.resolve(
+            session.room.localParticipant.unpublishTrack(camPub.track, false)
+          ).catch(() => {});
         }
         if (nextTrack && !session.isVideoOff) {
           await session.room.localParticipant
@@ -686,7 +688,7 @@ export function useLiveKitRoom({
             session.peerMeta.set(key, latest);
           });
 
-          for (const [peerId, pc] of session.peerConnections.entries()) {
+          for (const [peerId, pc] of Array.from(session.peerConnections.entries())) {
             if (!activePeerIds.has(peerId)) {
               pc.close();
               session.peerConnections.delete(peerId);
@@ -695,7 +697,7 @@ export function useLiveKitRoom({
             }
           }
 
-          for (const peerId of activePeerIds) {
+          for (const peerId of Array.from(activePeerIds)) {
             if (peerId === userId) continue;
             if (userId < peerId && !session.peerConnections.has(peerId)) {
               const pc = createMeshPeerConnection(peerId, true);
@@ -1159,7 +1161,9 @@ export function useLiveKitRoom({
       if (session.room) {
         try {
           if (nextSharing) {
-            let pub = null;
+            let pub: Awaited<
+              ReturnType<typeof session.room.localParticipant.setScreenShareEnabled>
+            > | null = null;
             try {
               pub = await session.room.localParticipant.setScreenShareEnabled(true, {
                 audio: true,
@@ -1167,7 +1171,7 @@ export function useLiveKitRoom({
                 systemAudio: "include",
                 selfBrowserSurface: "exclude",
                 surfaceSwitching: "include"
-              });
+              } as any);
             } catch (audioErr: any) {
               if (audioErr?.name === "NotAllowedError" || audioErr?.name === "AbortError") return;
               pub = await session.room.localParticipant.setScreenShareEnabled(true, {
@@ -1175,7 +1179,7 @@ export function useLiveKitRoom({
                 contentHint: "detail",
                 selfBrowserSurface: "exclude",
                 surfaceSwitching: "include"
-              });
+              } as any);
             }
 
             const publishedTrack = pub?.track?.mediaStreamTrack;
@@ -1237,7 +1241,9 @@ export function useLiveKitRoom({
           };
 
           try {
-            displayStream = await navigator.mediaDevices.getDisplayMedia(displayOptions);
+            displayStream = await navigator.mediaDevices.getDisplayMedia(
+              displayOptions as DisplayMediaStreamOptions
+            );
           } catch (audioErr: any) {
             if (audioErr?.name === "NotAllowedError" || audioErr?.name === "AbortError") return;
             displayStream = await navigator.mediaDevices.getDisplayMedia({
@@ -1251,7 +1257,7 @@ export function useLiveKitRoom({
           if (screenTrack) {
             if ("contentHint" in screenTrack) {
               try {
-                screenTrack.contentHint = "detail";
+                (screenTrack as MediaStreamTrack & { contentHint?: string }).contentHint = "detail";
               } catch {
                 // Ignore unsupported hint
               }
