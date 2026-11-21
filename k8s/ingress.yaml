@@ -4,7 +4,7 @@ metadata:
   name: ramameet-ingress
   namespace: default
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
 spec:
   ingressClassName: traefik
   tls:
@@ -28,4 +28,4 @@ spec:
               service:
                 name: ramameet-web
                 port:
-                  number: 3000
+                  number: 80
