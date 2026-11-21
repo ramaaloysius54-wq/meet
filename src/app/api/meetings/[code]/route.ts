@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { createServerSupabase } from "@/lib/supabase/server";
+import { createAdminSupabase } from "@/lib/supabase/admin";
 
 const updateSchema = z.object({
   status: z.enum(["scheduled", "live", "ended"]).optional(),
@@ -16,7 +17,10 @@ export async function GET(_req: Request, context: { params: { code: string } }) 
   } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { data: meeting, error } = await supabase
+  // Lookup berdasarkan kode meeting eksak (tidak pernah mengembalikan password_hash)
+  const lookupClient = createAdminSupabase() || supabase;
+
+  const { data: meeting, error } = await lookupClient
     .from("meetings")
     .select(
       `
@@ -33,7 +37,7 @@ export async function GET(_req: Request, context: { params: { code: string } }) 
     return NextResponse.json({ error: "Meeting tidak ditemukan" }, { status: 404 });
   }
 
-  const { data: participants } = await supabase
+  const { data: participants } = await lookupClient
     .from("meeting_participants")
     .select(
       `
@@ -67,7 +71,10 @@ export async function PATCH(req: Request, context: { params: { code: string } })
 
   if (!existing) return NextResponse.json({ error: "Meeting tidak ditemukan" }, { status: 404 });
   if (existing.host_id !== user.id) {
-    return NextResponse.json({ error: "Hanya Host yang dapat mengubah status meeting" }, { status: 403 });
+    return NextResponse.json(
+      { error: "Hanya Host yang dapat mengubah status meeting" },
+      { status: 403 }
+    );
   }
 
   const updatePayload: Record<string, unknown> = { ...parsed.data };
@@ -103,7 +110,6 @@ export async function DELETE(_req: Request, context: { params: { code: string } 
     return NextResponse.json({ error: "Meeting tidak ditemukan" }, { status: 404 });
   }
 
-  // Jika Host -> hapus meeting beserta cascade (participants, messages, recordings)
   if (existing.host_id === user.id) {
     const { error } = await supabase
       .from("meetings")
@@ -115,7 +121,6 @@ export async function DELETE(_req: Request, context: { params: { code: string } 
     return NextResponse.json({ ok: true, mode: "deleted_meeting" });
   }
 
-  // Jika bukan Host -> hapus keanggotaan diri sendiri dari riwayat meeting yang sudah berakhir
   if (existing.status !== "ended") {
     return NextResponse.json(
       { error: "Hanya Host yang dapat menghapus meeting yang masih aktif/terjadwal" },

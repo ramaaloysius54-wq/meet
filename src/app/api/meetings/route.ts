@@ -10,7 +10,10 @@ const createMeetingSchema = z.object({
   meeting_code: z
     .string()
     .trim()
-    .regex(/^[A-Za-z0-9-]{4,32}$/, "Kode meeting hanya boleh huruf, angka, dan tanda hubung (4-32 karakter)")
+    .regex(
+      /^[A-Za-z0-9-]{4,32}$/,
+      "Kode meeting hanya boleh huruf, angka, dan tanda hubung (4-32 karakter)"
+    )
     .optional(),
   description: z.string().max(500).optional(),
   password: z.string().max(64).optional(),
@@ -26,7 +29,18 @@ export async function GET() {
 
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { data: meetings, error } = await supabase
+  // Ambil hanya meeting_id di mana user ini benar-benar ikut sebagai peserta
+  const { data: participantRows } = await supabase
+    .from("meeting_participants")
+    .select("meeting_id")
+    .eq("user_id", user.id)
+    .neq("status", "removed");
+
+  const joinedIds = Array.from(
+    new Set((participantRows || []).map((row) => row.meeting_id).filter(Boolean))
+  );
+
+  let query = supabase
     .from("meetings")
     .select(
       `
@@ -38,6 +52,14 @@ export async function GET() {
     )
     .order("created_at", { ascending: false })
     .limit(50);
+
+  if (joinedIds.length > 0) {
+    query = query.or(`host_id.eq.${user.id},id.in.(${joinedIds.join(",")})`);
+  } else {
+    query = query.eq("host_id", user.id);
+  }
+
+  const { data: meetings, error } = await query;
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });

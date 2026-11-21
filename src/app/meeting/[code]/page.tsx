@@ -17,6 +17,7 @@ import { MeetingGrid } from "@/components/meeting/MeetingGrid";
 import { MeetingControls } from "@/components/meeting/MeetingControls";
 import { ParticipantPanel } from "@/components/meeting/ParticipantPanel";
 import { ChatPanel } from "@/components/meeting/ChatPanel";
+import { InviteModal } from "@/components/meeting/InviteModal";
 import { useMeetingStore } from "@/stores/useMeetingStore";
 import {
   fetchMessages,
@@ -66,10 +67,10 @@ export default function MeetingRoomPage() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [chatBoxVisible, setChatBoxVisible] = useState(true);
+  const [inviteModalOpen, setInviteModalOpen] = useState(false);
 
   const isHost = Boolean(meeting && profile && meeting.host_id === profile.id);
 
-  // Load meeting metadata & join token
   const joinRoom = useCallback(
     async (pwd?: string) => {
       try {
@@ -110,7 +111,6 @@ export default function MeetingRoomPage() {
     }
   }, [profile, joinRoom]);
 
-  // Meeting Duration Timer
   useEffect(() => {
     if (!joined) return;
     const base = meeting?.started_at ? new Date(meeting.started_at).getTime() : Date.now();
@@ -120,7 +120,6 @@ export default function MeetingRoomPage() {
     return () => clearInterval(timer);
   }, [joined, meeting?.started_at]);
 
-  // Supabase Realtime subscription for chat & waiting room sync
   useEffect(() => {
     if (!joined || !meeting) return;
     const supabase = createClient();
@@ -159,7 +158,6 @@ export default function MeetingRoomPage() {
     };
   }, [joined, meeting, meetingCode, setMessages]);
 
-  // WebRTC + LiveKit SFU Hook
   const lk = useLiveKitRoom({
     meetingCode,
     token: lkToken,
@@ -171,7 +169,6 @@ export default function MeetingRoomPage() {
     enabled: joined && Boolean(profile)
   });
 
-  // Socket.IO Signaling Hook
   const signaling = useSignaling({
     meetingCode,
     userId: profile?.id || "",
@@ -222,13 +219,8 @@ export default function MeetingRoomPage() {
     signaling.emitChat(saved);
   };
 
-  const handleInvite = () => {
-    navigator.clipboard.writeText(window.location.href);
-    pushNotification({
-      title: "Undangan Disalin",
-      message: "Bagikan link meeting ini kepada peserta lain.",
-      type: "success"
-    });
+  const handleOpenInvite = () => {
+    setInviteModalOpen(true);
   };
 
   const handleMuteAll = async () => {
@@ -386,7 +378,6 @@ export default function MeetingRoomPage() {
             </div>
           </div>
 
-          {/* Optional SFU Configuration Notice (honest status) */}
           {lk.sfuNotice && (
             <div className="mb-2.5 rounded-xl border border-rm-primary/40 bg-rm-primary/10 px-3 py-1.5 text-[11px] text-sky-200">
               {lk.sfuNotice}
@@ -401,7 +392,11 @@ export default function MeetingRoomPage() {
 
           {/* 2x2 Video Grid */}
           <div className="min-h-0 flex-1">
-            <MeetingGrid tiles={tiles} viewMode={viewMode} onStopScreenShare={lk.toggleScreenShare} />
+            <MeetingGrid
+              tiles={tiles}
+              viewMode={viewMode}
+              onStopScreenShare={lk.toggleScreenShare}
+            />
           </div>
 
           {/* Bottom Control Bar */}
@@ -410,6 +405,10 @@ export default function MeetingRoomPage() {
             isMuted={lk.isMuted}
             isVideoOff={lk.isVideoOff}
             isScreenSharing={lk.isScreenSharing}
+            isScreenPaused={lk.isScreenPaused}
+            cameraEffect={lk.cameraEffect}
+            micBusy={lk.micBusy}
+            camBusy={lk.camBusy}
             isLocked={Boolean(meeting?.is_locked)}
             isRecording={Boolean(meeting?.is_recording)}
             participantCount={tiles.length}
@@ -421,6 +420,8 @@ export default function MeetingRoomPage() {
             onToggleMute={lk.toggleMute}
             onToggleVideo={lk.toggleVideo}
             onToggleScreenShare={lk.toggleScreenShare}
+            onTogglePauseScreenShare={lk.togglePauseScreenShare}
+            onChangeCameraEffect={lk.setCameraEffect}
             onSelectAudio={lk.switchAudioDevice}
             onSelectVideo={lk.switchVideoDevice}
             onOpenParticipants={() => {
@@ -432,6 +433,7 @@ export default function MeetingRoomPage() {
               setChatBoxVisible(true);
               setMobileDrawerOpen(true);
             }}
+            onOpenInvite={handleOpenInvite}
             onSendReaction={(emoji) => {
               pushReaction({
                 id: crypto.randomUUID(),
@@ -447,9 +449,8 @@ export default function MeetingRoomPage() {
           />
         </section>
 
-        {/* RIGHT SIDEBAR (Desktop Permanent Split View persis referensi RamaMeet) */}
+        {/* RIGHT SIDEBAR (Desktop) */}
         <aside className="hidden lg:flex w-80 shrink-0 flex-col gap-3 overflow-hidden">
-          {/* Tabs Header */}
           <div className="grid grid-cols-2 rounded-xl border border-rm-border/70 bg-rm-sidebar p-1">
             <button
               type="button"
@@ -480,14 +481,13 @@ export default function MeetingRoomPage() {
             </button>
           </div>
 
-          {/* Participants Card (selalu tampil di atas saat tab Participants aktif, persis referensi) */}
           {rightTab === "participants" && (
             <div className="rounded-2xl border border-rm-border/70 bg-rm-sidebar p-3.5">
               <ParticipantPanel
                 tiles={tiles}
                 waitingList={waitingList}
                 isHost={isHost}
-                onInvite={handleInvite}
+                onInvite={handleOpenInvite}
                 onMuteAll={handleMuteAll}
                 onMuteUser={handleMuteUser}
                 onRemoveUser={handleRemoveUser}
@@ -496,7 +496,6 @@ export default function MeetingRoomPage() {
             </div>
           )}
 
-          {/* Chat Meeting Card (bawah pada split-view atau penuh saat tab Chat dipilih) */}
           {(chatBoxVisible || rightTab === "chat") && (
             <div className="min-h-0 flex-1">
               <ChatPanel
@@ -553,7 +552,7 @@ export default function MeetingRoomPage() {
                     tiles={tiles}
                     waitingList={waitingList}
                     isHost={isHost}
-                    onInvite={handleInvite}
+                    onInvite={handleOpenInvite}
                     onMuteAll={handleMuteAll}
                     onMuteUser={handleMuteUser}
                     onRemoveUser={handleRemoveUser}
@@ -571,6 +570,22 @@ export default function MeetingRoomPage() {
           </div>
         )}
       </div>
+
+      {/* Modal Undangan 2 Opsi: Link Meeting & Meeting Code */}
+      <InviteModal
+        open={inviteModalOpen}
+        onClose={() => setInviteModalOpen(false)}
+        meetingCode={meetingCode}
+        meetingTitle={meeting?.title || "RamaMeet Meeting"}
+        hasPassword={Boolean(meeting?.has_password)}
+        onCopied={(label) =>
+          pushNotification({
+            title: "Berhasil Disalin",
+            message: `${label} siap dibagikan ke peserta.`,
+            type: "success"
+          })
+        }
+      />
     </AppShell>
   );
 }
