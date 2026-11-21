@@ -8,22 +8,16 @@ metadata:
 spec:
   project: ramameet
   source:
-    repoURL: "https://github.com/ramaaloysius54-wq/meet.git"
+    repoURL: https://github.com/ramaaloysius54-wq/meet.git
     targetRevision: main
     path: k8s
+    directory:
+      recurse: true
+      exclude: "argocd/*"
   destination:
     server: https://kubernetes.default.svc
-    namespace: ramameet
+    namespace: default
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - PrunePropagationPolicy=foreground
-    retry:
-      limit: 5
-      backoff:
-        duration: 5s
-        factor: 2
-        maxDuration: 3m

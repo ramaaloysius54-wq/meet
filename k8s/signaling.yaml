@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ramameet-signaling
-  namespace: ramameet
+  namespace: default
 spec:
   replicas: 2
   selector:
@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: signaling
-          image: ghcr.io/YOUR_ORG/ramameet:latest
+          image: ghcr.io/ramaaloysius54-wq/meet:latest
           command: ["node", "signaling/dist/index.js"]
           ports:
             - containerPort: 4000
@@ -48,7 +48,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: ramameet-signaling
-  namespace: ramameet
+  namespace: default
 spec:
   selector:
     app: ramameet-signaling

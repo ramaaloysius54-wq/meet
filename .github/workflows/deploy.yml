@@ -71,79 +71,75 @@ jobs:
             -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22" \
             ./ "$VPS_USER@$VPS_HOST:/var/www/ramameet/"
 
-      - name: ☸️ Sync ArgoCD & Rollout Pods K3s
+      - name: ☸️ Sync ArgoCD & Rollout Pods K3s (Namespace default)
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
           GHCR_USER: ${{ github.actor }}
           GHCR_PASS: ${{ secrets.GITHUB_TOKEN }}
+          FULL_IMAGE: ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:latest
         run: |
-          echo "3. Sinkronisasi ArgoCD & Rollout K3s..."
+          echo "3. Sinkronisasi ArgoCD & Rollout K3s di namespace default..."
           sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 \
-            "$VPS_USER@$VPS_HOST" "bash -s -- '$GHCR_USER' '$GHCR_PASS'" << 'ENDK8S'
+            "$VPS_USER@$VPS_HOST" "bash -s -- '$GHCR_USER' '$GHCR_PASS' '$FULL_IMAGE'" << 'ENDK8S'
             set -euo pipefail
             GHCR_USER="$1"
             GHCR_PASS="$2"
+            FULL_IMAGE="$3"
             export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-            # 1. Pastikan namespace ramameet selalu ada
-            kubectl create namespace ramameet --dry-run=client -o yaml | kubectl apply -f -
-
-            # 2. Pasang pull secret GHCR ke ServiceAccount default agar tidak ImagePullBackOff
+            # 1. Pasang pull secret GHCR ke ServiceAccount default di namespace default
             kubectl create secret docker-registry ghcr-secret \
-              --namespace=ramameet \
+              --namespace=default \
               --docker-server=ghcr.io \
               --docker-username="$GHCR_USER" \
               --docker-password="$GHCR_PASS" \
               --dry-run=client -o yaml | kubectl apply -f -
 
-            kubectl patch serviceaccount default -n ramameet \
+            kubectl patch serviceaccount default -n default \
               -p '{"imagePullSecrets":[{"name":"ghcr-secret"}]}' || true
 
+            # 2. Salin Secret env dari namespace ramameet lama ke default & bersihkan resource lama
+            if kubectl get namespace ramameet >/dev/null 2>&1; then
+              for SEC in $(kubectl get secrets -n ramameet -o jsonpath='{.items[?(@.type=="Opaque")].metadata.name}' 2>/dev/null || true); do
+                if ! kubectl get secret "$SEC" -n default >/dev/null 2>&1; then
+                  kubectl get secret "$SEC" -n ramameet -o yaml \
+                    | sed '/namespace:/d; /resourceVersion:/d; /uid:/d; /creationTimestamp:/d' \
+                    | kubectl apply -n default -f - || true
+                fi
+              done
+              kubectl delete ingress,deployment,service,hpa --all -n ramameet --ignore-not-found=true || true
+            fi
+
             # 3. Apply Project & Application ArgoCD
-            if [ -f /var/www/ramameet/k8s/argocd/project.yaml ]; then
-              kubectl apply -f /var/www/ramameet/k8s/argocd/project.yaml
-            elif [ -f /var/www/ramameet/k8s/project.yaml ]; then
-              kubectl apply -f /var/www/ramameet/k8s/project.yaml
-            fi
-
-            if [ -f /var/www/ramameet/k8s/argocd/application.yaml ]; then
-              kubectl apply -f /var/www/ramameet/k8s/argocd/application.yaml
-            elif [ -f /var/www/ramameet/k8s/application.yaml ]; then
-              kubectl apply -f /var/www/ramameet/k8s/application.yaml
-            fi
-
-            kubectl patch application ramameet-prod -n argocd --type merge \
-              -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true},"syncOptions":["CreateNamespace=true"]}}}' || true
-
-            # 4. Paksa ArgoCD sync manifest terbaru dari Git
+            kubectl apply -f /var/www/ramameet/k8s/argocd/project.yaml
+            kubectl apply -f /var/www/ramameet/k8s/argocd/application.yaml
             kubectl annotate application ramameet-prod -n argocd \
               argocd.argoproj.io/refresh="hard" --overwrite || true
 
-            # 5. Apply manifest workload langsung jika deployment belum dibuat oleh ArgoCD
-            if ! kubectl get deployment ramameet-web -n ramameet >/dev/null 2>&1; then
-              find /var/www/ramameet/k8s -maxdepth 2 -type f \( -name "*.yaml" -o -name "*.yml" \) \
-                ! -path "*/argocd/*" ! -name "project.yaml" ! -name "application.yaml" \
-                -exec kubectl apply -f {} \;
-            fi
+            # 4. Apply langsung manifest workload ke namespace default
+            find /var/www/ramameet/k8s -maxdepth 2 -type f \( -name "*.yaml" -o -name "*.yml" \) \
+              ! -path "*/argocd/*" ! -name "project.yaml" ! -name "application.yaml" ! -name "*namespace*.yaml" \
+              -exec kubectl apply -n default -f {} \;
 
-            # 6. Rollout aman untuk single-node VPS + auto-diagnosa jika pod gagal start
+            # 5. Rollout aman di namespace default + auto-diagnosa
             rollout_check() {
               local DEPLOY="$1"
-              if kubectl get deployment "$DEPLOY" -n ramameet >/dev/null 2>&1; then
-                kubectl patch deployment "$DEPLOY" -n ramameet --type merge \
+              if kubectl get deployment "$DEPLOY" -n default >/dev/null 2>&1; then
+                kubectl patch deployment "$DEPLOY" -n default --type merge \
                   -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}' || true
 
-                kubectl rollout restart deployment/"$DEPLOY" -n ramameet
+                kubectl set image deployment/"$DEPLOY" "*=$FULL_IMAGE" -n default || true
+                kubectl rollout restart deployment/"$DEPLOY" -n default
 
-                if ! kubectl rollout status deployment/"$DEPLOY" -n ramameet --timeout=180s; then
+                if ! kubectl rollout status deployment/"$DEPLOY" -n default --timeout=180s; then
                   echo "=== ROLLOUT $DEPLOY GAGAL - STATUS POD ==="
-                  kubectl get pods -n ramameet -o wide
+                  kubectl get pods -n default -l app="$DEPLOY" -o wide || kubectl get pods -n default -o wide
                   echo "=== EVENTS TERBARU ==="
-                  kubectl get events -n ramameet --sort-by='.lastTimestamp' | tail -n 20
+                  kubectl get events -n default --sort-by='.lastTimestamp' | tail -n 20
                   echo "=== LOGS CONTAINER ==="
-                  kubectl logs -n ramameet deployment/"$DEPLOY" --tail=50 --all-containers=true || true
+                  kubectl logs -n default deployment/"$DEPLOY" --tail=50 --all-containers=true || true
                   exit 1
                 fi
               fi
@@ -152,7 +148,7 @@ jobs:
             rollout_check ramameet-web
             rollout_check ramameet-signaling
 
-            # 7. Status akhir ArgoCD & Pods
+            # 6. Status akhir ArgoCD & Pods di namespace default
             kubectl get applications -n argocd || true
-            kubectl get pods -n ramameet -o wide
+            kubectl get pods -n default -o wide
           ENDK8S

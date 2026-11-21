@@ -9,7 +9,7 @@ spec:
     - "https://github.com/ramaaloysius54-wq/meet"
     - "https://github.com/ramaaloysius54-wq/meet.git"
   destinations:
-    - namespace: ramameet
+    - namespace: default
       server: https://kubernetes.default.svc
     - namespace: argocd
       server: https://kubernetes.default.svc
