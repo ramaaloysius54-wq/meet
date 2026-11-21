@@ -1,16 +1,16 @@
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi
 
-FROM node:20-alpine AS signaling-builder
+FROM node:22-alpine AS signaling-builder
 WORKDIR /signaling
 COPY server/package.json server/package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi
 COPY server/ ./
 RUN npm run build && npm prune --omit=dev
 
-FROM node:20-alpine AS web-builder
+FROM node:22-alpine AS web-builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -30,7 +30,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 
 RUN npm run build
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
