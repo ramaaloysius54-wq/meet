@@ -1,179 +1,220 @@
 "use client";
 
-import { Suspense, useState } from "react";
-import Link from "next/link";
+import React, { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Video, Mail, Lock, ArrowRight, CheckCircle2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const redirect = searchParams.get("redirect") || "/";
-  const callbackError = searchParams.get("error");
+  const redirectTo = searchParams.get("redirect") || "/";
 
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(
-    callbackError === "verifikasi_gagal"
-      ? "Link verifikasi sudah kedaluwarsa. Masukkan email Anda lalu klik Verifikasi."
-      : null
-  );
-  const [info, setInfo] = useState<string | null>(null);
-  const [unconfirmed, setUnconfirmed] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [verifying, setVerifying] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    setError(null);
-    setInfo(null);
-    setUnconfirmed(false);
     setLoading(true);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+
     try {
       const supabase = createClient();
-      const { error: authErr } = await supabase.auth.signInWithPassword({
-        email: email.trim().toLowerCase(),
-        password
-      });
-      if (authErr) throw authErr;
-      router.push(redirect);
-      router.refresh();
-    } catch (err: any) {
-      const msg = String(err?.message || "Email atau password salah");
-      if (msg.toLowerCase().includes("email not confirmed")) {
-        setUnconfirmed(true);
-        setError("Email Anda belum diverifikasi. Klik tombol di bawah untuk langsung verifikasi.");
+
+      if (mode === "login") {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        });
+        if (error) throw error;
+        router.push(redirectTo);
+        router.refresh();
       } else {
-        setError(msg);
+        const { data, error } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+          options: {
+            data: {
+              full_name: fullName.trim() || email.split("@")[0],
+            },
+          },
+        });
+        if (error) throw error;
+
+        if (data.session) {
+          router.push(redirectTo);
+          router.refresh();
+        } else {
+          setSuccessMsg("Akun berhasil dibuat. Silakan cek email untuk verifikasi atau langsung login.");
+          setMode("login");
+        }
       }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Terjadi kesalahan saat autentikasi.";
+      setErrorMsg(message);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleInstantVerifyAndLogin = async () => {
-    if (!email.trim()) return;
-    setVerifying(true);
-    setError(null);
-    setInfo(null);
-    try {
-      const normalizedEmail = email.trim().toLowerCase();
-      const res = await fetch("/api/auth/verify-instant", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: normalizedEmail })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Gagal memverifikasi email");
-
-      setInfo("Email berhasil diverifikasi! Sedang masuk...");
-      setUnconfirmed(false);
-
-      if (password) {
-        const supabase = createClient();
-        const { error: loginErr } = await supabase.auth.signInWithPassword({
-          email: normalizedEmail,
-          password
-        });
-        if (loginErr) throw loginErr;
-        router.push(redirect);
-        router.refresh();
-      }
-    } catch (err: any) {
-      setError(err.message || "Gagal memverifikasi email");
-    } finally {
-      setVerifying(false);
-    }
-  };
-
   return (
-    <div className="flex min-h-screen items-center justify-center bg-rm-bg p-4">
-      <div className="w-full max-w-md rounded-2xl border border-rm-border bg-rm-sidebar p-7 shadow-panel">
-        <div className="mb-6 flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-[#38BDF8] via-rm-primary to-rm-secondary shadow-blue-glow">
-            <Video className="h-6 w-6 text-white" />
+    <div className="relative min-h-screen w-full overflow-hidden bg-gradient-to-br from-blue-700 via-blue-500 to-white flex items-center justify-center p-4 sm:p-6">
+      {/* Aksen latar belakang biru-putih lembut */}
+      <div className="pointer-events-none absolute -top-24 -left-24 h-80 w-80 rounded-full bg-blue-400/40 blur-3xl" />
+      <div className="pointer-events-none absolute -bottom-24 -right-24 h-96 w-96 rounded-full bg-white/70 blur-3xl" />
+
+      <div className="relative z-10 w-full max-w-md">
+        {/* Header Brand Rama Meet */}
+        <div className="mb-6 text-center">
+          <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-white shadow-lg shadow-blue-900/15 ring-1 ring-blue-100">
+            <svg
+              className="h-8 w-8 text-blue-600"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <polygon points="23 7 16 12 23 17 23 7" />
+              <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+            </svg>
           </div>
-          <div>
-            <h1 className="text-xl font-bold text-white">RamaMeet</h1>
-            <p className="text-xs text-rm-muted">Connect • Collaborate • Grow</p>
-          </div>
+          <h1 className="text-3xl font-extrabold tracking-tight text-white drop-shadow-sm">
+            Rama Meet
+          </h1>
+          <p className="mt-1 text-sm font-medium text-blue-50">
+            Video conference cepat, jernih, dan langsung terhubung
+          </p>
         </div>
 
-        <h2 className="text-lg font-semibold text-rm-text">Masuk ke Akun Anda</h2>
-        <p className="mt-1 text-xs text-rm-muted">
-          Kelola rapat video HD dan kolaborasi tim secara real-time.
-        </p>
-
-        {info && (
-          <div className="mt-4 rounded-xl border border-rm-success/40 bg-rm-success/10 p-3 text-xs text-rm-success">
-            {info}
+        {/* Card Form Putih Rapih */}
+        <div className="rounded-2xl bg-white/95 p-6 sm:p-8 shadow-2xl shadow-blue-950/15 backdrop-blur-md border border-blue-100">
+          {/* Tab Masuk / Daftar */}
+          <div className="mb-6 grid grid-cols-2 rounded-xl bg-blue-50 p-1">
+            <button
+              type="button"
+              onClick={() => {
+                setMode("login");
+                setErrorMsg(null);
+                setSuccessMsg(null);
+              }}
+              className={`rounded-lg py-2 text-sm font-semibold transition-all ${
+                mode === "login"
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-blue-700 hover:bg-blue-100/70"
+              }`}
+            >
+              Masuk
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setMode("register");
+                setErrorMsg(null);
+                setSuccessMsg(null);
+              }}
+              className={`rounded-lg py-2 text-sm font-semibold transition-all ${
+                mode === "register"
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-blue-700 hover:bg-blue-100/70"
+              }`}
+            >
+              Daftar
+            </button>
           </div>
-        )}
 
-        {error && (
-          <div className="mt-4 space-y-2 rounded-xl border border-rm-danger/40 bg-rm-danger/10 p-3 text-xs text-rm-danger">
-            <p>{error}</p>
-            {unconfirmed && (
-              <button
-                type="button"
-                disabled={verifying}
-                onClick={handleInstantVerifyAndLogin}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-rm-success px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600 disabled:opacity-60"
-              >
-                <CheckCircle2 className="h-3.5 w-3.5" />
-                <span>{verifying ? "Memverifikasi..." : "Verifikasi Email Sekarang"}</span>
-              </button>
+          {errorMsg && (
+            <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              {errorMsg}
+            </div>
+          )}
+
+          {successMsg && (
+            <div className="mb-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+              {successMsg}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {mode === "register" && (
+              <div>
+                <label className="mb-1.5 block text-sm font-semibold text-slate-700">
+                  Nama Lengkap
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={fullName}
+                  onChange={(e) => setFullName(e.target.value)}
+                  placeholder="Nama Anda"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                />
+              </div>
             )}
-          </div>
-        )}
 
-        <form onSubmit={handleLogin} className="mt-5 space-y-4">
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-rm-muted">Email</label>
-            <div className="relative">
-              <Mail className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-rm-muted" />
+            <div>
+              <label className="mb-1.5 block text-sm font-semibold text-slate-700">
+                Email
+              </label>
               <input
                 type="email"
                 required
+                autoComplete="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                placeholder="nama@perusahaan.com"
-                className="h-11 w-full rounded-xl border border-rm-border bg-rm-bg pl-10 pr-4 text-sm text-rm-text focus:border-rm-primary focus:outline-none"
+                placeholder="nama@email.com"
+                className="w-full rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
               />
             </div>
-          </div>
 
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-rm-muted">Password</label>
-            <div className="relative">
-              <Lock className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-rm-muted" />
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                className="h-11 w-full rounded-xl border border-rm-border bg-rm-bg pl-10 pr-4 text-sm text-rm-text focus:border-rm-primary focus:outline-none"
-              />
+            <div>
+              <label className="mb-1.5 block text-sm font-semibold text-slate-700">
+                Password
+              </label>
+              <div className="relative">
+                <input
+                  type={showPassword ? "text" : "password"}
+                  required
+                  minLength={6}
+                  autoComplete={mode === "login" ? "current-password" : "new-password"}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-2.5 pr-16 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((prev) => !prev)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-semibold text-blue-600 hover:text-blue-800"
+                >
+                  {showPassword ? "Tutup" : "Lihat"}
+                </button>
+              </div>
             </div>
-          </div>
 
-          <button
-            type="submit"
-            disabled={loading}
-            className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-rm-primary to-rm-secondary text-sm font-semibold text-white shadow-blue-glow transition hover:brightness-110 disabled:opacity-60"
-          >
-            <span>{loading ? "Memproses..." : "Masuk"}</span>
-            <ArrowRight className="h-4 w-4" />
-          </button>
-        </form>
+            <button
+              type="submit"
+              disabled={loading}
+              className="mt-2 w-full rounded-xl bg-blue-600 px-4 py-3 text-sm font-bold text-white shadow-md shadow-blue-600/25 transition-all hover:bg-blue-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {loading
+                ? "Memproses..."
+                : mode === "login"
+                ? "Masuk ke Rama Meet"
+                : "Buat Akun Rama Meet"}
+            </button>
+          </form>
+        </div>
 
-        <p className="mt-6 text-center text-xs text-rm-muted">
-          Belum punya akun?{" "}
-          <Link href="/register" className="font-semibold text-rm-primary hover:underline">
-            Daftar sekarang
-          </Link>
+        <p className="mt-5 text-center text-xs font-medium text-blue-900/70">
+          © {new Date().getFullYear()} Rama Meet
         </p>
       </div>
     </div>
@@ -182,7 +223,13 @@ function LoginForm() {
 
 export default function LoginPage() {
   return (
-    <Suspense fallback={<div className="min-h-screen bg-rm-bg" />}>
+    <Suspense
+      fallback={
+        <div className="min-h-screen w-full bg-gradient-to-br from-blue-700 via-blue-500 to-white flex items-center justify-center">
+          <div className="text-white font-semibold">Memuat Rama Meet...</div>
+        </div>
+      }
+    >
       <LoginForm />
     </Suspense>
   );

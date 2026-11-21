@@ -66,6 +66,7 @@ class MeshSession {
   room: Room | null = null;
   localMediaStream: MediaStream | null = null;
   localScreenStream: MediaStream | null = null;
+  mediaInitPromise: Promise<void> | null = null;
   effectProcessor: VideoEffectProcessor | null = null;
   cameraEffect: VideoEffectId = "none";
   channel: RealtimeChannel | null = null;
@@ -130,8 +131,7 @@ class MeshSession {
     }
   }
 
-  cleanupAll() {
-    this.destroyEffectProcessor();
+  cleanupTransport() {
     if (this.room) {
       try {
         this.room.disconnect();
@@ -141,6 +141,11 @@ class MeshSession {
       this.room = null;
     }
     this.cleanupMesh();
+  }
+
+  cleanupAll() {
+    this.destroyEffectProcessor();
+    this.cleanupTransport();
     this.localMediaStream?.getTracks().forEach((t) => t.stop());
     this.localScreenStream?.getTracks().forEach((t) => {
       t.onended = null;
@@ -148,6 +153,7 @@ class MeshSession {
     });
     this.localMediaStream = null;
     this.localScreenStream = null;
+    this.mediaInitPromise = null;
     this.isScreenSharing = false;
     this.isScreenPaused = false;
   }
@@ -249,7 +255,8 @@ export function useLiveKitRoom({
       const scrPub = p.getTrackPublication(Track.Source.ScreenShare);
       const scrAudioPub = p.getTrackPublication(Track.Source.ScreenShareAudio);
 
-      const camTrack = camPub?.track?.mediaStreamTrack || null;
+      const camTrack =
+        camPub?.track?.mediaStreamTrack || (local ? session.getEffectiveCameraTrack() : null);
       const scrTrack = scrPub?.track?.mediaStreamTrack || null;
       const hasActiveScreen = Boolean(
         scrTrack &&
@@ -258,8 +265,12 @@ export function useLiveKitRoom({
           !(local && session.isScreenPaused)
       );
 
-      const mutedState = micPub ? micPub.isMuted : true;
-      const videoOffState = camPub ? camPub.isMuted || !camTrack : true;
+      const mutedState = micPub ? micPub.isMuted : local ? session.isMuted : true;
+      const videoOffState = camPub
+        ? camPub.isMuted || !camTrack
+        : local
+        ? session.isVideoOff || !camTrack
+        : true;
 
       if (local) {
         session.isMuted = mutedState;
@@ -280,7 +291,7 @@ export function useLiveKitRoom({
         isScreenSharing: hasActiveScreen,
         connectionQuality: mapQuality(p.connectionQuality),
         videoTrack: !videoOffState ? camTrack : null,
-        audioTrack: micPub?.track?.mediaStreamTrack || null,
+        audioTrack: micPub?.track?.mediaStreamTrack || (local ? session.getRawAudioTrack() : null),
         screenTrack: hasActiveScreen ? scrTrack : null,
         screenAudioTrack: hasActiveScreen ? scrAudioPub?.track?.mediaStreamTrack || null : null
       };
@@ -367,6 +378,79 @@ export function useLiveKitRoom({
 
     setTiles([localTile, ...remoteTiles]);
   }, [avatarUrl, isHost, sessionKey, setTiles, userId, userName]);
+
+  const ensureLocalMedia = useCallback(async () => {
+    const session = getSession(sessionKey);
+    if (session.getRawCameraTrack() || session.getRawAudioTrack()) {
+      return;
+    }
+
+    if (session.mediaInitPromise) {
+      await session.mediaInitPromise;
+      return;
+    }
+
+    session.mediaInitPromise = (async () => {
+      if (!navigator.mediaDevices?.getUserMedia) return;
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: AUDIO_CONSTRAINTS,
+          video: VIDEO_CONSTRAINTS
+        });
+        session.localMediaStream = stream;
+        session.isMuted = false;
+        session.isVideoOff = false;
+        setIsMuted(false);
+        setIsVideoOff(false);
+        await refreshDevices();
+        return;
+      } catch {
+        // Fallback terpisah: kamera saja atau audio saja
+      }
+
+      const combined = new MediaStream();
+      let gotAudio = false;
+      let gotVideo = false;
+
+      try {
+        const vStream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
+        vStream.getVideoTracks().forEach((t) => combined.addTrack(t));
+        gotVideo = combined.getVideoTracks().length > 0;
+      } catch {
+        gotVideo = false;
+      }
+
+      try {
+        const aStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
+        aStream.getAudioTracks().forEach((t) => combined.addTrack(t));
+        gotAudio = combined.getAudioTracks().length > 0;
+      } catch {
+        gotAudio = false;
+      }
+
+      session.localMediaStream = combined;
+      session.isMuted = !gotAudio;
+      session.isVideoOff = !gotVideo;
+      setIsMuted(!gotAudio);
+      setIsVideoOff(!gotVideo);
+      await refreshDevices();
+
+      if (!gotAudio && !gotVideo) {
+        pushNotification({
+          title: "Mode Penonton",
+          message: "Kamera/mikrofon tidak terdeteksi atau belum diizinkan. Anda tetap dapat bergabung.",
+          type: "info"
+        });
+      }
+    })();
+
+    try {
+      await session.mediaInitPromise;
+    } finally {
+      session.mediaInitPromise = null;
+    }
+  }, [pushNotification, refreshDevices, sessionKey]);
 
   const trackMeshPresence = useCallback(async () => {
     const session = getSession(sessionKey);
@@ -491,6 +575,31 @@ export function useLiveKitRoom({
     [applyCameraTrackToTransport, pushNotification, sessionKey]
   );
 
+  // Langsung buka kamera & tampilkan preview lokal sejak awal tanpa menunggu connect/klik
+  useEffect(() => {
+    if (!meetingCode || !userId) return;
+    let unmounted = false;
+    const session = getSession(sessionKey);
+
+    const openCameraImmediately = async () => {
+      await ensureLocalMedia();
+      if (unmounted) return;
+      if (!session.room) {
+        syncMeshTiles();
+      } else {
+        syncLiveKitTiles();
+      }
+    };
+
+    void openCameraImmediately();
+
+    return () => {
+      unmounted = true;
+      session.cleanupAll();
+      sessions.delete(sessionKey);
+    };
+  }, [ensureLocalMedia, meetingCode, sessionKey, syncLiveKitTiles, syncMeshTiles, userId]);
+
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
@@ -595,75 +704,12 @@ export function useLiveKitRoom({
       return pc;
     };
 
-    const acquireInitialLocalMedia = async () => {
-      // Coba audio + video bersamaan; jika gagal, coba satu per satu agar tidak total mati
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: AUDIO_CONSTRAINTS,
-          video: VIDEO_CONSTRAINTS
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        session.localMediaStream = stream;
-        session.isMuted = false;
-        session.isVideoOff = false;
-        setIsMuted(false);
-        setIsVideoOff(false);
-        await refreshDevices();
-        return;
-      } catch {
-        // Fallback terpisah: audio saja atau video saja
-      }
-
-      const combined = new MediaStream();
-      let gotAudio = false;
-      let gotVideo = false;
-
-      try {
-        const aStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
-        aStream.getAudioTracks().forEach((t) => combined.addTrack(t));
-        gotAudio = combined.getAudioTracks().length > 0;
-      } catch {
-        gotAudio = false;
-      }
-
-      try {
-        const vStream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
-        vStream.getVideoTracks().forEach((t) => combined.addTrack(t));
-        gotVideo = combined.getVideoTracks().length > 0;
-      } catch {
-        gotVideo = false;
-      }
-
-      if (cancelled) {
-        combined.getTracks().forEach((t) => t.stop());
-        return;
-      }
-
-      session.localMediaStream = combined;
-      session.isMuted = !gotAudio;
-      session.isVideoOff = !gotVideo;
-      setIsMuted(!gotAudio);
-      setIsVideoOff(!gotVideo);
-      await refreshDevices();
-
-      if (!gotAudio && !gotVideo) {
-        pushNotification({
-          title: "Mode Penonton",
-          message: "Kamera/mikrofon tidak terdeteksi atau belum diizinkan. Anda tetap dapat bergabung.",
-          type: "info"
-        });
-      }
-    };
-
     const startMultiUserMeshFallback = async (reason: string) => {
       setIsSFUConnected(false);
       setSfuNotice(reason);
       setConnectionState("mesh-connected");
 
-      await acquireInitialLocalMedia();
+      await ensureLocalMedia();
       if (cancelled) return;
       syncMeshTiles();
 
@@ -788,6 +834,11 @@ export function useLiveKitRoom({
     };
 
     const connectLiveKit = async () => {
+      // Pastikan kamera sudah terbuka dan tampil sebelum proses koneksi selesai
+      await ensureLocalMedia();
+      if (cancelled) return;
+      syncMeshTiles();
+
       if (!token || !serverUrl) {
         await startMultiUserMeshFallback(
           "Mode Multi-User WebRTC Mesh aktif (Kamera + Efek + Share Screen simultan)."
@@ -852,15 +903,33 @@ export function useLiveKitRoom({
         }
         setSfuNotice(null);
 
-        // Aktifkan mic & kamera terpisah agar kegagalan salah satu tidak mematikan keduanya
-        await room.localParticipant.setMicrophoneEnabled(true).catch(() => {
-          session.isMuted = true;
-          setIsMuted(true);
-        });
-        await room.localParticipant.setCameraEnabled(true).catch(() => {
-          session.isVideoOff = true;
-          setIsVideoOff(true);
-        });
+        // Gunakan track kamera & mic yang sudah langsung terbuka sejak awal
+        const existingAudio = session.getRawAudioTrack();
+        const existingCam = session.getEffectiveCameraTrack();
+
+        if (existingAudio && !session.isMuted) {
+          existingAudio.enabled = true;
+          await room.localParticipant
+            .publishTrack(existingAudio, { source: Track.Source.Microphone })
+            .catch(() => room.localParticipant.setMicrophoneEnabled(true).catch(() => {}));
+        } else if (!session.isMuted) {
+          await room.localParticipant.setMicrophoneEnabled(true).catch(() => {
+            session.isMuted = true;
+            setIsMuted(true);
+          });
+        }
+
+        if (existingCam && !session.isVideoOff) {
+          existingCam.enabled = true;
+          await room.localParticipant
+            .publishTrack(existingCam, { source: Track.Source.Camera })
+            .catch(() => room.localParticipant.setCameraEnabled(true).catch(() => {}));
+        } else if (!session.isVideoOff) {
+          await room.localParticipant.setCameraEnabled(true).catch(() => {
+            session.isVideoOff = true;
+            setIsVideoOff(true);
+          });
+        }
 
         await refreshDevices();
         syncLiveKitTiles();
@@ -873,15 +942,15 @@ export function useLiveKitRoom({
       }
     };
 
-    connectLiveKit();
+    void connectLiveKit();
 
     return () => {
       cancelled = true;
-      session.cleanupAll();
-      sessions.delete(sessionKey);
+      session.cleanupTransport();
     };
   }, [
     enabled,
+    ensureLocalMedia,
     meetingCode,
     token,
     serverUrl,
@@ -1091,7 +1160,7 @@ export function useLiveKitRoom({
     await trackMeshPresence();
   }, [replaceMeshRoleTrack, sessionKey, syncMeshTiles, trackMeshPresence]);
 
-  // Pause / Resume Share Screen TANPA muncul pop-up Allow browser lagi
+  // Pause / Resume Share Screen
   const togglePauseScreenShare = useCallback(async () => {
     const session = getSession(sessionKey);
     if (!session.isScreenSharing) return;
@@ -1122,96 +1191,106 @@ export function useLiveKitRoom({
     await trackMeshPresence();
   }, [replaceMeshRoleTrack, sessionKey, syncLiveKitTiles, syncMeshTiles, trackMeshPresence]);
 
-  // Share Screen (Resume otomatis jika sedang di-pause -> tidak perlu klik Allow ulang)
+  // Share Screen 1-Klik ON / 1-Klik OFF langsung
   const toggleScreenShare = useCallback(async () => {
     const session = getSession(sessionKey);
     if (session.screenLock) return;
 
-    // Jika stream share screen masih hidup tapi sedang di-pause, langsung resume tanpa dialog Allow!
-    if (session.isScreenSharing && session.isScreenPaused) {
-      await togglePauseScreenShare();
-      return;
-    }
-
     session.screenLock = true;
     try {
-      const nextSharing = !session.isScreenSharing;
-
-      if (nextSharing) {
-        if (typeof window !== "undefined" && !window.isSecureContext) {
-          pushNotification({
-            title: "HTTPS Diperlukan",
-            message: "Fitur Share Screen hanya bisa dijalankan melalui HTTPS atau localhost.",
-            type: "error"
-          });
-          return;
+      // 1-KLIK OFF: jika sedang share screen (termasuk saat pause), langsung matikan total
+      if (session.isScreenSharing) {
+        if (session.room) {
+          await session.room.localParticipant.setScreenShareEnabled(false).catch(() => {});
+          for (const pub of Array.from(session.room.localParticipant.trackPublications.values())) {
+            if (
+              pub.source === Track.Source.ScreenShare ||
+              pub.source === Track.Source.ScreenShareAudio
+            ) {
+              if (pub.track) {
+                await Promise.resolve(
+                  session.room.localParticipant.unpublishTrack(pub.track, true)
+                ).catch(() => {});
+                pub.track.stop();
+              }
+            }
+          }
+          session.isScreenSharing = false;
+          session.isScreenPaused = false;
+          setIsScreenSharing(false);
+          setIsScreenPaused(false);
+          syncLiveKitTiles();
+        } else {
+          await stopLocalScreenStream();
         }
+        return;
+      }
 
-        if (!navigator.mediaDevices?.getDisplayMedia) {
-          pushNotification({
-            title: "Browser Tidak Mendukung",
-            message: "Perangkat/browser ini tidak mendukung Share Screen.",
-            type: "warning"
-          });
-          return;
-        }
+      // 1-KLIK ON
+      if (typeof window !== "undefined" && !window.isSecureContext) {
+        pushNotification({
+          title: "HTTPS Diperlukan",
+          message: "Fitur Share Screen hanya bisa dijalankan melalui HTTPS atau localhost.",
+          type: "error"
+        });
+        return;
+      }
+
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        pushNotification({
+          title: "Browser Tidak Mendukung",
+          message: "Perangkat/browser ini tidak mendukung Share Screen.",
+          type: "warning"
+        });
+        return;
       }
 
       // 1. LiveKit SFU
       if (session.room) {
         try {
-          if (nextSharing) {
-            let pub: Awaited<
-              ReturnType<typeof session.room.localParticipant.setScreenShareEnabled>
-            > | null = null;
-            try {
-              pub = await session.room.localParticipant.setScreenShareEnabled(true, {
-                audio: true,
-                contentHint: "detail",
-                systemAudio: "include",
-                selfBrowserSurface: "exclude",
-                surfaceSwitching: "include"
-              } as any);
-            } catch (audioErr: any) {
-              if (audioErr?.name === "NotAllowedError" || audioErr?.name === "AbortError") return;
-              pub = await session.room.localParticipant.setScreenShareEnabled(true, {
-                audio: false,
-                contentHint: "detail",
-                selfBrowserSurface: "exclude",
-                surfaceSwitching: "include"
-              } as any);
-            }
-
-            const publishedTrack = pub?.track?.mediaStreamTrack;
-            if (publishedTrack) {
-              publishedTrack.onended = () => {
-                session.room?.localParticipant.setScreenShareEnabled(false).catch(() => {});
-                session.isScreenSharing = false;
-                session.isScreenPaused = false;
-                setIsScreenSharing(false);
-                setIsScreenPaused(false);
-                syncLiveKitTiles();
-              };
-            }
-
-            session.isScreenSharing = true;
-            session.isScreenPaused = false;
-            setIsScreenSharing(true);
-            setIsScreenPaused(false);
-            syncLiveKitTiles();
-            pushNotification({
-              title: "Share Screen Aktif",
-              message: "Gunakan tombol Pause untuk jeda sementara tanpa perlu klik Allow ulang.",
-              type: "success"
-            });
-          } else {
-            await session.room.localParticipant.setScreenShareEnabled(false);
-            session.isScreenSharing = false;
-            session.isScreenPaused = false;
-            setIsScreenSharing(false);
-            setIsScreenPaused(false);
-            syncLiveKitTiles();
+          let pub: Awaited<
+            ReturnType<typeof session.room.localParticipant.setScreenShareEnabled>
+          > | null = null;
+          try {
+            pub = await session.room.localParticipant.setScreenShareEnabled(true, {
+              audio: true,
+              contentHint: "detail",
+              systemAudio: "include",
+              selfBrowserSurface: "exclude",
+              surfaceSwitching: "include"
+            } as any);
+          } catch (audioErr: any) {
+            if (audioErr?.name === "NotAllowedError" || audioErr?.name === "AbortError") return;
+            pub = await session.room.localParticipant.setScreenShareEnabled(true, {
+              audio: false,
+              contentHint: "detail",
+              selfBrowserSurface: "exclude",
+              surfaceSwitching: "include"
+            } as any);
           }
+
+          const publishedTrack = pub?.track?.mediaStreamTrack;
+          if (publishedTrack) {
+            publishedTrack.onended = () => {
+              session.room?.localParticipant.setScreenShareEnabled(false).catch(() => {});
+              session.isScreenSharing = false;
+              session.isScreenPaused = false;
+              setIsScreenSharing(false);
+              setIsScreenPaused(false);
+              syncLiveKitTiles();
+            };
+          }
+
+          session.isScreenSharing = true;
+          session.isScreenPaused = false;
+          setIsScreenSharing(true);
+          setIsScreenPaused(false);
+          syncLiveKitTiles();
+          pushNotification({
+            title: "Share Screen Aktif",
+            message: "Klik tombol Share Screen sekali lagi untuk mematikan.",
+            type: "success"
+          });
         } catch (err: any) {
           if (err?.name !== "NotAllowedError" && err?.name !== "AbortError") {
             pushNotification({
@@ -1225,71 +1304,67 @@ export function useLiveKitRoom({
       }
 
       // 2. WebRTC Mesh
-      if (nextSharing) {
+      try {
+        let displayStream: MediaStream;
+        const displayOptions: DisplayMediaStreamOptions & Record<string, unknown> = {
+          video: {
+            frameRate: { ideal: 30, max: 60 },
+            width: { ideal: 1920, max: 2560 },
+            height: { ideal: 1080, max: 1440 }
+          },
+          audio: true,
+          systemAudio: "include",
+          selfBrowserSurface: "exclude",
+          surfaceSwitching: "include"
+        };
+
         try {
-          let displayStream: MediaStream;
-          const displayOptions: DisplayMediaStreamOptions & Record<string, unknown> = {
-            video: {
-              frameRate: { ideal: 30, max: 60 },
-              width: { ideal: 1920, max: 2560 },
-              height: { ideal: 1080, max: 1440 }
-            },
-            audio: true,
-            systemAudio: "include",
-            selfBrowserSurface: "exclude",
-            surfaceSwitching: "include"
-          };
-
-          try {
-            displayStream = await navigator.mediaDevices.getDisplayMedia(
-              displayOptions as DisplayMediaStreamOptions
-            );
-          } catch (audioErr: any) {
-            if (audioErr?.name === "NotAllowedError" || audioErr?.name === "AbortError") return;
-            displayStream = await navigator.mediaDevices.getDisplayMedia({
-              video: true,
-              audio: false
-            });
-          }
-
-          session.localScreenStream = displayStream;
-          const screenTrack = displayStream.getVideoTracks()[0];
-          if (screenTrack) {
-            if ("contentHint" in screenTrack) {
-              try {
-                (screenTrack as MediaStreamTrack & { contentHint?: string }).contentHint = "detail";
-              } catch {
-                // Ignore unsupported hint
-              }
-            }
-            screenTrack.onended = () => {
-              stopLocalScreenStream();
-            };
-            await replaceMeshRoleTrack("screen", screenTrack);
-          }
-
-          session.isScreenSharing = true;
-          session.isScreenPaused = false;
-          setIsScreenSharing(true);
-          setIsScreenPaused(false);
-          syncMeshTiles();
-          await trackMeshPresence();
-          pushNotification({
-            title: "Share Screen Aktif",
-            message: "Gunakan tombol Pause untuk jeda sementara tanpa perlu klik Allow ulang.",
-            type: "success"
+          displayStream = await navigator.mediaDevices.getDisplayMedia(
+            displayOptions as DisplayMediaStreamOptions
+          );
+        } catch (audioErr: any) {
+          if (audioErr?.name === "NotAllowedError" || audioErr?.name === "AbortError") return;
+          displayStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: false
           });
-        } catch (err: any) {
-          if (err?.name !== "NotAllowedError" && err?.name !== "AbortError") {
-            pushNotification({
-              title: "Share Screen Gagal",
-              message: err?.message || "Izin berbagi layar ditolak atau gagal dimulai.",
-              type: "error"
-            });
-          }
         }
-      } else {
-        await stopLocalScreenStream();
+
+        session.localScreenStream = displayStream;
+        const screenTrack = displayStream.getVideoTracks()[0];
+        if (screenTrack) {
+          if ("contentHint" in screenTrack) {
+            try {
+              (screenTrack as MediaStreamTrack & { contentHint?: string }).contentHint = "detail";
+            } catch {
+              // Ignore unsupported hint
+            }
+          }
+          screenTrack.onended = () => {
+            void stopLocalScreenStream();
+          };
+          await replaceMeshRoleTrack("screen", screenTrack);
+        }
+
+        session.isScreenSharing = true;
+        session.isScreenPaused = false;
+        setIsScreenSharing(true);
+        setIsScreenPaused(false);
+        syncMeshTiles();
+        await trackMeshPresence();
+        pushNotification({
+          title: "Share Screen Aktif",
+          message: "Klik tombol Share Screen sekali lagi untuk mematikan.",
+          type: "success"
+        });
+      } catch (err: any) {
+        if (err?.name !== "NotAllowedError" && err?.name !== "AbortError") {
+          pushNotification({
+            title: "Share Screen Gagal",
+            message: err?.message || "Izin berbagi layar ditolak atau gagal dimulai.",
+            type: "error"
+          });
+        }
       }
     } finally {
       session.screenLock = false;
@@ -1301,7 +1376,6 @@ export function useLiveKitRoom({
     stopLocalScreenStream,
     syncLiveKitTiles,
     syncMeshTiles,
-    togglePauseScreenShare,
     trackMeshPresence
   ]);
 
