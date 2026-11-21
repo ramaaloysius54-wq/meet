@@ -4,16 +4,15 @@ metadata:
   name: ramameet-ingress
   namespace: ramameet
   annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
-    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
   ingressClassName: traefik
   tls:
     - hosts:
-        - meet.yourdomain.com
+        - meet.portofoliorama.my.id
       secretName: ramameet-tls
   rules:
-    - host: meet.yourdomain.com
+    - host: meet.portofoliorama.my.id
       http:
         paths:
           - path: /socket.io
@@ -23,17 +22,10 @@ spec:
                 name: ramameet-signaling
                 port:
                   number: 4000
-          - path: /rtc
-            pathType: Prefix
-            backend:
-              service:
-                name: ramameet-livekit
-                port:
-                  number: 7880
           - path: /
             pathType: Prefix
             backend:
               service:
                 name: ramameet-web
                 port:
-                  number: 80
+                  number: 3000

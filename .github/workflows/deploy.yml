@@ -1,0 +1,105 @@
+name: CI/CD Pipeline RamaMeet DevOps
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-deploy:
+    name: Build Docker & Deploy RamaMeet (VPS + K3s + ArgoCD)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐳 Set Lowercase Image Name
+        id: meta
+        run: |
+          IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: 🛠️ Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Login to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏗️ Build & Push Docker Image RamaMeet
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:latest
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 🚀 Sync Manifests & Files ke VPS (/var/www/ramameet)
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y sshpass rsync
+
+          echo "1. Pastikan direktori target ada di VPS..."
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" \
+            "mkdir -p /var/www/ramameet"
+
+          echo "2. Mengirim file terbaru ke VPS..."
+          sshpass -e rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='server/node_modules' \
+            --exclude='.next' \
+            --exclude='.env' \
+            -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22" \
+            ./ "$VPS_USER@$VPS_HOST:/var/www/ramameet/"
+
+      - name: ☸️ Sync ArgoCD & Rollout Pods K3s
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          echo "3. Sinkronisasi ArgoCD & Rollout K3s..."
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" << 'ENDK8S'
+            set -e
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+            # 1. Pastikan Project & Application ArgoCD terdaftar + Auto-Sync aktif
+            kubectl apply -f /var/www/ramameet/k8s/argocd/project.yaml
+            kubectl apply -f /var/www/ramameet/k8s/argocd/application.yaml
+            kubectl patch application ramameet-prod -n argocd --type merge \
+              -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' || true
+
+            # 2. Paksa ArgoCD menarik perubahan manifest terbaru dari Git (folder k8s/)
+            kubectl annotate application ramameet-prod -n argocd \
+              argocd.argoproj.io/refresh="hard" --overwrite || true
+
+            # 3. Rollout restart agar K3s menarik Docker image :latest terbaru dari GHCR
+            kubectl rollout restart deployment/ramameet-web -n ramameet
+            kubectl rollout restart deployment/ramameet-signaling -n ramameet
+
+            kubectl rollout status deployment/ramameet-web -n ramameet --timeout=120s
+            kubectl rollout status deployment/ramameet-signaling -n ramameet --timeout=120s
+
+            # 4. Cek status akhir ArgoCD & Pods
+            kubectl get applications -n argocd
+            kubectl get pods -n ramameet -o wide
+          ENDK8S
