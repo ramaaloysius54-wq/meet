@@ -83,8 +83,8 @@ jobs:
             export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
             # 1. Pastikan Project & Application ArgoCD terdaftar + Auto-Sync aktif
-            kubectl apply -f /var/www/ramameet/k8s/argocd/project.yaml
-            kubectl apply -f /var/www/ramameet/k8s/argocd/application.yaml
+            kubectl apply -f /var/www/ramameet/k8s/project.yaml
+            kubectl apply -f /var/www/ramameet/k8s/application.yaml
             kubectl patch application ramameet-prod -n argocd --type merge \
               -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' || true
 

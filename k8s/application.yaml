@@ -8,7 +8,7 @@ metadata:
 spec:
   project: ramameet
   source:
-    repoURL: "https://github.com/ramaaloysius54-wq/ramameet.git"
+    repoURL: "https://github.com/ramaaloysius54-wq/meet.git"
     targetRevision: main
     path: k8s
   destination:
