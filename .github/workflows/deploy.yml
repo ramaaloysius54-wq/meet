@@ -55,7 +55,7 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
         run: |
-          sudo apt-get update && sudo apt-get install -y sshpass rsync
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass rsync
 
           echo "1. Pastikan direktori target ada di VPS..."
           sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" \
@@ -76,16 +76,32 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_PASS: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "3. Sinkronisasi ArgoCD & Rollout K3s..."
-          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" << 'ENDK8S'
-            set -e
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 \
+            "$VPS_USER@$VPS_HOST" "bash -s -- '$GHCR_USER' '$GHCR_PASS'" << 'ENDK8S'
+            set -euo pipefail
+            GHCR_USER="$1"
+            GHCR_PASS="$2"
             export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
             # 1. Pastikan namespace ramameet selalu ada
             kubectl create namespace ramameet --dry-run=client -o yaml | kubectl apply -f -
 
-            # 2. Apply Project & Application ArgoCD (mendukung folder k8s/argocd/ maupun k8s/)
+            # 2. Pasang pull secret GHCR ke ServiceAccount default agar tidak ImagePullBackOff
+            kubectl create secret docker-registry ghcr-secret \
+              --namespace=ramameet \
+              --docker-server=ghcr.io \
+              --docker-username="$GHCR_USER" \
+              --docker-password="$GHCR_PASS" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            kubectl patch serviceaccount default -n ramameet \
+              -p '{"imagePullSecrets":[{"name":"ghcr-secret"}]}' || true
+
+            # 3. Apply Project & Application ArgoCD
             if [ -f /var/www/ramameet/k8s/argocd/project.yaml ]; then
               kubectl apply -f /var/www/ramameet/k8s/argocd/project.yaml
             elif [ -f /var/www/ramameet/k8s/project.yaml ]; then
@@ -101,29 +117,42 @@ jobs:
             kubectl patch application ramameet-prod -n argocd --type merge \
               -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true},"syncOptions":["CreateNamespace=true"]}}}' || true
 
-            # 3. Paksa ArgoCD menarik perubahan manifest terbaru dari Git
+            # 4. Paksa ArgoCD sync manifest terbaru dari Git
             kubectl annotate application ramameet-prod -n argocd \
               argocd.argoproj.io/refresh="hard" --overwrite || true
 
-            # 4. Jika deployment belum terbuat oleh ArgoCD, apply manifest workload langsung
+            # 5. Apply manifest workload langsung jika deployment belum dibuat oleh ArgoCD
             if ! kubectl get deployment ramameet-web -n ramameet >/dev/null 2>&1; then
               find /var/www/ramameet/k8s -maxdepth 2 -type f \( -name "*.yaml" -o -name "*.yml" \) \
                 ! -path "*/argocd/*" ! -name "project.yaml" ! -name "application.yaml" \
                 -exec kubectl apply -f {} \;
             fi
 
-            # 5. Rollout restart agar K3s menarik Docker image :latest terbaru dari GHCR
-            if kubectl get deployment ramameet-web -n ramameet >/dev/null 2>&1; then
-              kubectl rollout restart deployment/ramameet-web -n ramameet
-              kubectl rollout status deployment/ramameet-web -n ramameet --timeout=120s
-            fi
+            # 6. Rollout aman untuk single-node VPS + auto-diagnosa jika pod gagal start
+            rollout_check() {
+              local DEPLOY="$1"
+              if kubectl get deployment "$DEPLOY" -n ramameet >/dev/null 2>&1; then
+                kubectl patch deployment "$DEPLOY" -n ramameet --type merge \
+                  -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}' || true
 
-            if kubectl get deployment ramameet-signaling -n ramameet >/dev/null 2>&1; then
-              kubectl rollout restart deployment/ramameet-signaling -n ramameet
-              kubectl rollout status deployment/ramameet-signaling -n ramameet --timeout=120s
-            fi
+                kubectl rollout restart deployment/"$DEPLOY" -n ramameet
 
-            # 6. Cek status akhir ArgoCD & Pods
+                if ! kubectl rollout status deployment/"$DEPLOY" -n ramameet --timeout=180s; then
+                  echo "=== ROLLOUT $DEPLOY GAGAL - STATUS POD ==="
+                  kubectl get pods -n ramameet -o wide
+                  echo "=== EVENTS TERBARU ==="
+                  kubectl get events -n ramameet --sort-by='.lastTimestamp' | tail -n 20
+                  echo "=== LOGS CONTAINER ==="
+                  kubectl logs -n ramameet deployment/"$DEPLOY" --tail=50 --all-containers=true || true
+                  exit 1
+                fi
+              fi
+            }
+
+            rollout_check ramameet-web
+            rollout_check ramameet-signaling
+
+            # 7. Status akhir ArgoCD & Pods
             kubectl get applications -n argocd || true
             kubectl get pods -n ramameet -o wide
           ENDK8S
