@@ -6,9 +6,9 @@ export function checkRateLimit(key: string, limit = 60, windowMs = 60_000): bool
 
   // Bersihkan entry kadaluwarsa agar tidak bocor memori saat banyak user aktif
   if (buckets.size > 500) {
-    for (const [k, v] of buckets.entries()) {
+    buckets.forEach((v, k) => {
       if (v.resetAt < now) buckets.delete(k);
-    }
+    });
   }
 
   const entry = buckets.get(key);
