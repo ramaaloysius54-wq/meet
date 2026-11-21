@@ -4,12 +4,18 @@ metadata:
   name: ramameet
   namespace: argocd
 spec:
-  description: RamaMeet Production Project
+  description: Project ArgoCD untuk RamaMeet
   sourceRepos:
-  - '*'
+    - "https://github.com/ramaaloysius54-wq/meet"
+    - "https://github.com/ramaaloysius54-wq/meet.git"
   destinations:
-  - namespace: ramameet
-    server: https://kubernetes.default.svc
+    - namespace: ramameet
+      server: https://kubernetes.default.svc
+    - namespace: argocd
+      server: https://kubernetes.default.svc
   clusterResourceWhitelist:
-  - group: '*'
-    kind: '*'
+    - group: "*"
+      kind: "*"
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
