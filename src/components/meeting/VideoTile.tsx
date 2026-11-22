@@ -19,32 +19,125 @@ export function VideoTile({
 }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const screenAudioRef = useRef<HTMLAudioElement>(null);
 
   const showingScreen = !forceCameraOnly && tile.isScreenSharing && Boolean(tile.screenTrack);
   const activeVideoTrack = showingScreen ? tile.screenTrack : tile.videoTrack;
   const showVideo = Boolean(activeVideoTrack) && (!tile.isVideoOff || showingScreen);
 
+  // Video kamera / share screen: anti layar hitam & anti kedip saat ON/OFF
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
-    if (showVideo && activeVideoTrack) {
-      el.srcObject = new MediaStream([activeVideoTrack]);
-      el.play().catch(() => {});
-    } else {
+
+    if (!showVideo || !activeVideoTrack) {
       el.srcObject = null;
+      return;
     }
+
+    const currentStream = el.srcObject instanceof MediaStream ? el.srcObject : null;
+    const currentTrack = currentStream?.getVideoTracks()[0] || null;
+
+    if (currentTrack !== activeVideoTrack) {
+      el.srcObject = new MediaStream([activeVideoTrack]);
+    }
+
+    const tryPlay = () => {
+      if (el.paused) {
+        void el.play().catch(() => {});
+      }
+    };
+
+    tryPlay();
+    el.addEventListener("loadedmetadata", tryPlay);
+    activeVideoTrack.addEventListener("unmute", tryPlay);
+
+    return () => {
+      el.removeEventListener("loadedmetadata", tryPlay);
+      activeVideoTrack.removeEventListener("unmute", tryPlay);
+    };
   }, [activeVideoTrack, showVideo]);
 
+  // Audio mikrofon peserta lain: langsung bunyi real-time & auto-retry jika ketahan autoplay
   useEffect(() => {
     const el = audioRef.current;
     if (!el || tile.isLocal) return;
-    if (tile.audioTrack) {
-      el.srcObject = new MediaStream([tile.audioTrack]);
-      el.play().catch(() => {});
-    } else {
+
+    const track = !tile.isMuted ? tile.audioTrack : null;
+    if (!track) {
       el.srcObject = null;
+      return;
     }
-  }, [tile.audioTrack, tile.isLocal]);
+
+    const currentStream = el.srcObject instanceof MediaStream ? el.srcObject : null;
+    const currentTrack = currentStream?.getAudioTracks()[0] || null;
+
+    if (currentTrack !== track) {
+      el.srcObject = new MediaStream([track]);
+    }
+
+    el.muted = false;
+    el.volume = 1;
+
+    const tryPlay = () => {
+      el.muted = false;
+      void el.play().catch(() => {});
+    };
+
+    tryPlay();
+    track.addEventListener("unmute", tryPlay);
+    window.addEventListener("pointerdown", tryPlay, { once: true, passive: true });
+
+    return () => {
+      track.removeEventListener("unmute", tryPlay);
+      window.removeEventListener("pointerdown", tryPlay);
+    };
+  }, [tile.audioTrack, tile.isLocal, tile.isMuted]);
+
+  // Audio dari Share Screen peserta lain (tab/system audio)
+  useEffect(() => {
+    const el = screenAudioRef.current;
+    if (!el || tile.isLocal) return;
+
+    const track = showingScreen ? tile.screenAudioTrack || null : null;
+    if (!track) {
+      el.srcObject = null;
+      return;
+    }
+
+    const currentStream = el.srcObject instanceof MediaStream ? el.srcObject : null;
+    const currentTrack = currentStream?.getAudioTracks()[0] || null;
+
+    if (currentTrack !== track) {
+      el.srcObject = new MediaStream([track]);
+    }
+
+    el.muted = false;
+    el.volume = 1;
+
+    const tryPlay = () => {
+      el.muted = false;
+      void el.play().catch(() => {});
+    };
+
+    tryPlay();
+    track.addEventListener("unmute", tryPlay);
+    window.addEventListener("pointerdown", tryPlay, { once: true, passive: true });
+
+    return () => {
+      track.removeEventListener("unmute", tryPlay);
+      window.removeEventListener("pointerdown", tryPlay);
+    };
+  }, [showingScreen, tile.isLocal, tile.screenAudioTrack]);
+
+  // Bersihkan seluruh media stream saat tile unmount (peserta keluar)
+  useEffect(() => {
+    return () => {
+      if (videoRef.current) videoRef.current.srcObject = null;
+      if (audioRef.current) audioRef.current.srcObject = null;
+      if (screenAudioRef.current) screenAudioRef.current.srcObject = null;
+    };
+  }, []);
 
   return (
     <div
@@ -82,6 +175,7 @@ export function VideoTile({
 
       {/* Remote Audio */}
       {!tile.isLocal && <audio ref={audioRef} autoPlay playsInline />}
+      {!tile.isLocal && showingScreen && <audio ref={screenAudioRef} autoPlay playsInline />}
 
       {/* Top-Right HOST & Screen Badges */}
       <div className="absolute right-2.5 top-2.5 flex items-center gap-1.5">
