@@ -25,7 +25,6 @@ export function VideoTile({
   const activeVideoTrack = showingScreen ? tile.screenTrack : tile.videoTrack;
   const showVideo = Boolean(activeVideoTrack) && (!tile.isVideoOff || showingScreen);
 
-  // Video kamera / share screen: anti layar hitam & anti kedip saat ON/OFF
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
@@ -58,12 +57,12 @@ export function VideoTile({
     };
   }, [activeVideoTrack, showVideo]);
 
-  // Audio mikrofon peserta lain: langsung bunyi real-time & auto-retry jika ketahan autoplay
+  // Tetap pasang stream audio remote dan atur mute lewat el.muted (anti blokir autoplay Android)
   useEffect(() => {
     const el = audioRef.current;
     if (!el || tile.isLocal) return;
 
-    const track = !tile.isMuted ? tile.audioTrack : null;
+    const track = tile.audioTrack;
     if (!track) {
       el.srcObject = null;
       return;
@@ -76,25 +75,26 @@ export function VideoTile({
       el.srcObject = new MediaStream([track]);
     }
 
-    el.muted = false;
     el.volume = 1;
+    el.muted = tile.isMuted;
 
     const tryPlay = () => {
-      el.muted = false;
+      el.muted = tile.isMuted;
       void el.play().catch(() => {});
     };
 
     tryPlay();
     track.addEventListener("unmute", tryPlay);
+    window.addEventListener("touchstart", tryPlay, { once: true, passive: true });
     window.addEventListener("pointerdown", tryPlay, { once: true, passive: true });
 
     return () => {
       track.removeEventListener("unmute", tryPlay);
+      window.removeEventListener("touchstart", tryPlay);
       window.removeEventListener("pointerdown", tryPlay);
     };
   }, [tile.audioTrack, tile.isLocal, tile.isMuted]);
 
-  // Audio dari Share Screen peserta lain (tab/system audio)
   useEffect(() => {
     const el = screenAudioRef.current;
     if (!el || tile.isLocal) return;
@@ -112,8 +112,8 @@ export function VideoTile({
       el.srcObject = new MediaStream([track]);
     }
 
-    el.muted = false;
     el.volume = 1;
+    el.muted = false;
 
     const tryPlay = () => {
       el.muted = false;
@@ -122,15 +122,16 @@ export function VideoTile({
 
     tryPlay();
     track.addEventListener("unmute", tryPlay);
+    window.addEventListener("touchstart", tryPlay, { once: true, passive: true });
     window.addEventListener("pointerdown", tryPlay, { once: true, passive: true });
 
     return () => {
       track.removeEventListener("unmute", tryPlay);
+      window.removeEventListener("touchstart", tryPlay);
       window.removeEventListener("pointerdown", tryPlay);
     };
   }, [showingScreen, tile.isLocal, tile.screenAudioTrack]);
 
-  // Bersihkan seluruh media stream saat tile unmount (peserta keluar)
   useEffect(() => {
     return () => {
       if (videoRef.current) videoRef.current.srcObject = null;

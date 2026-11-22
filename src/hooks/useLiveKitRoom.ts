@@ -1,7 +1,7 @@
 "use client";
 // @refresh reset
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ConnectionQuality,
   ConnectionState,
@@ -28,6 +28,7 @@ interface UseLiveKitRoomOptions {
 }
 
 interface MeshPeerMeta {
+  peerId: string;
   userId: string;
   name: string;
   avatarUrl?: string | null;
@@ -48,7 +49,10 @@ type MeetingSoundKind = "join" | "leave" | "toggle-on" | "toggle-off";
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  { urls: "stun:stun2.l.google.com:19302" }
+  { urls: "stun:stun2.l.google.com:19302" },
+  { urls: "stun:stun3.l.google.com:19302" },
+  { urls: "stun:stun4.l.google.com:19302" },
+  { urls: "stun:stun.cloudflare.com:3478" }
 ];
 
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
@@ -66,6 +70,21 @@ const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
 
 let sharedAudioCtx: AudioContext | null = null;
 let pendingJoinSound = false;
+
+function getClientPeerId(userId: string): string {
+  if (typeof window === "undefined") return userId;
+  const storageKey = `ramameet_peer_id_${userId}`;
+  try {
+    let tabId = window.sessionStorage.getItem(storageKey);
+    if (!tabId) {
+      tabId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+      window.sessionStorage.setItem(storageKey, tabId);
+    }
+    return `${userId}__${tabId}`;
+  } catch {
+    return `${userId}__${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
 
 function getSharedAudioContext(): AudioContext | null {
   if (typeof window === "undefined") return null;
@@ -102,7 +121,7 @@ function scheduleTone(
   gain.connect(ctx.destination);
 
   osc.start(now);
-  osc.stop(now + duration + 0.02);
+  osc.stop(now + duration + 0.03);
 }
 
 function playMeetingSound(kind: MeetingSoundKind) {
@@ -112,18 +131,18 @@ function playMeetingSound(kind: MeetingSoundKind) {
   const trigger = () => {
     try {
       if (kind === "join") {
-        // Chime dua nada hangat bergaya Google Meet / Zoom saat masuk meeting
-        scheduleTone(ctx, 523.25, 0, 0.22, 0.13, "sine");
-        scheduleTone(ctx, 659.25, 0.09, 0.24, 0.11, "sine");
-        scheduleTone(ctx, 783.99, 0.18, 0.34, 0.12, "triangle");
+        // Suara chime jernih bergaya Zoom / Google Meet saat masuk atau peserta bergabung
+        scheduleTone(ctx, 523.25, 0, 0.24, 0.32, "sine");
+        scheduleTone(ctx, 659.25, 0.09, 0.28, 0.3, "sine");
+        scheduleTone(ctx, 783.99, 0.19, 0.38, 0.28, "triangle");
       } else if (kind === "leave") {
-        // Chime lembut menurun saat peserta keluar
-        scheduleTone(ctx, 659.25, 0, 0.18, 0.09, "sine");
-        scheduleTone(ctx, 440.0, 0.11, 0.26, 0.09, "sine");
+        // Suara chime menurun saat keluar meeting
+        scheduleTone(ctx, 659.25, 0, 0.2, 0.26, "sine");
+        scheduleTone(ctx, 440.0, 0.12, 0.3, 0.24, "sine");
       } else if (kind === "toggle-on") {
-        scheduleTone(ctx, 620, 0, 0.075, 0.045, "sine");
+        scheduleTone(ctx, 680, 0, 0.085, 0.14, "sine");
       } else {
-        scheduleTone(ctx, 420, 0, 0.075, 0.045, "sine");
+        scheduleTone(ctx, 420, 0, 0.085, 0.14, "sine");
       }
     } catch {
       // Ignore Web Audio errors
@@ -157,9 +176,11 @@ class MeshSession {
   effectProcessor: VideoEffectProcessor | null = null;
   cameraEffect: VideoEffectId = "none";
   channel: RealtimeChannel | null = null;
+  heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   peerConnections = new Map<string, RTCPeerConnection>();
   remoteTracks = new Map<string, RemotePeerTracks>();
   peerMeta = new Map<string, MeshPeerMeta>();
+  peerLastSeen = new Map<string, number>();
   pendingIce = new Map<string, RTCIceCandidateInit[]>();
   knownRemotePeers = new Set<string>();
   hasPlayedJoinChime = false;
@@ -234,7 +255,24 @@ class MeshSession {
     }
   }
 
-  cleanupMesh() {
+  cleanupMesh(localPeerId?: string) {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+
+    if (this.channel && localPeerId) {
+      try {
+        void this.channel.send({
+          type: "broadcast",
+          event: "peer-leave",
+          payload: { peerId: localPeerId }
+        });
+      } catch {
+        // Ignore send error on cleanup
+      }
+    }
+
     this.peerConnections.forEach((pc) => {
       try {
         pc.close();
@@ -245,6 +283,7 @@ class MeshSession {
     this.peerConnections.clear();
     this.remoteTracks.clear();
     this.peerMeta.clear();
+    this.peerLastSeen.clear();
     this.pendingIce.clear();
     this.knownRemotePeers.clear();
 
@@ -259,7 +298,7 @@ class MeshSession {
     }
   }
 
-  cleanupTransport() {
+  cleanupTransport(localPeerId?: string) {
     if (this.room) {
       try {
         this.room.disconnect();
@@ -268,12 +307,12 @@ class MeshSession {
       }
       this.room = null;
     }
-    this.cleanupMesh();
+    this.cleanupMesh(localPeerId);
   }
 
-  cleanupAll() {
+  cleanupAll(localPeerId?: string) {
     this.destroyEffectProcessor();
-    this.cleanupTransport();
+    this.cleanupTransport(localPeerId);
     this.localMediaStream?.getTracks().forEach((t) => t.stop());
     this.localScreenStream?.getTracks().forEach((t) => {
       t.onended = null;
@@ -332,7 +371,10 @@ export function useLiveKitRoom({
   isHost,
   enabled
 }: UseLiveKitRoomOptions) {
-  const sessionKey = `${meetingCode}:${userId}`;
+  const normalizedCode = useMemo(() => meetingCode.trim().toLowerCase(), [meetingCode]);
+  const localPeerId = useMemo(() => getClientPeerId(userId), [userId]);
+  const sessionKey = `${normalizedCode}:${localPeerId}`;
+
   const setTiles = useMeetingStore((s) => s.setTiles);
   const pushNotification = useMeetingStore((s) => s.pushNotification);
 
@@ -374,7 +416,7 @@ export function useLiveKitRoom({
 
     if (typeof document !== "undefined") {
       document.querySelectorAll("audio").forEach((el) => {
-        if (el.srcObject && el.paused && !el.muted) {
+        if (el.srcObject && el.paused) {
           void el.play().catch(() => {});
         }
       });
@@ -384,11 +426,17 @@ export function useLiveKitRoom({
   useEffect(() => {
     if (typeof window === "undefined") return;
     const handleGesture = () => unlockAudio();
-    window.addEventListener("pointerdown", handleGesture, { passive: true });
-    window.addEventListener("keydown", handleGesture, { passive: true });
+    window.addEventListener("touchstart", handleGesture, { passive: true, capture: true });
+    window.addEventListener("touchend", handleGesture, { passive: true, capture: true });
+    window.addEventListener("pointerdown", handleGesture, { passive: true, capture: true });
+    window.addEventListener("click", handleGesture, { passive: true, capture: true });
+    window.addEventListener("keydown", handleGesture, { passive: true, capture: true });
     return () => {
-      window.removeEventListener("pointerdown", handleGesture);
-      window.removeEventListener("keydown", handleGesture);
+      window.removeEventListener("touchstart", handleGesture, true);
+      window.removeEventListener("touchend", handleGesture, true);
+      window.removeEventListener("pointerdown", handleGesture, true);
+      window.removeEventListener("click", handleGesture, true);
+      window.removeEventListener("keydown", handleGesture, true);
     };
   }, [unlockAudio]);
 
@@ -411,7 +459,7 @@ export function useLiveKitRoom({
             return track;
           }
         } catch {
-          // Lanjut ke fallback constraint berikutnya
+          // Try next fallback constraint
         }
       }
       return null;
@@ -445,7 +493,7 @@ export function useLiveKitRoom({
             return track;
           }
         } catch {
-          // Lanjut ke fallback constraint berikutnya
+          // Try next fallback constraint
         }
       }
       return null;
@@ -468,6 +516,20 @@ export function useLiveKitRoom({
     }
   }, []);
 
+  const buildLocalMeshMeta = useCallback((): MeshPeerMeta => {
+    const session = getSession(sessionKey);
+    return {
+      peerId: localPeerId,
+      userId,
+      name: userName,
+      avatarUrl: avatarUrl || null,
+      isHost,
+      isMuted: session.isMuted,
+      isVideoOff: session.isVideoOff,
+      isScreenSharing: session.isScreenSharing && !session.isScreenPaused
+    };
+  }, [avatarUrl, isHost, localPeerId, sessionKey, userId, userName]);
+
   const syncLiveKitTiles = useCallback(() => {
     const session = getSession(sessionKey);
     const room = session.room;
@@ -489,7 +551,6 @@ export function useLiveKitRoom({
       const pubCamTrack = camPub?.track?.mediaStreamTrack || null;
       const pubMicTrack = micPub?.track?.mediaStreamTrack || null;
 
-      // Untuk lokal, session.isMuted & session.isVideoOff adalah sumber kebenaran tunggal (anti state ketimpa)
       const camTrack = local
         ? session.getEffectiveCameraTrack() ||
           (pubCamTrack && pubCamTrack.readyState === "live" ? pubCamTrack : null)
@@ -532,11 +593,11 @@ export function useLiveKitRoom({
         isHost: local ? isHost : Boolean(meta.isHost),
         isMuted: mutedState,
         isVideoOff: videoOffState,
-        isSpeaking: local ? !mutedState && p.isSpeaking : !mutedState && p.isSpeaking,
+        isSpeaking: !mutedState && p.isSpeaking,
         isScreenSharing: hasActiveScreen,
         connectionQuality: mapQuality(p.connectionQuality),
         videoTrack: !videoOffState ? camTrack : null,
-        audioTrack: !mutedState ? micTrack : null,
+        audioTrack: micTrack,
         screenTrack: hasActiveScreen ? scrTrack : null,
         screenAudioTrack: hasActiveScreen ? scrAudioPub?.track?.mediaStreamTrack || null : null
       };
@@ -578,7 +639,7 @@ export function useLiveKitRoom({
     const localVideoOff = session.isVideoOff || !vTrack;
 
     const localTile: LiveParticipantTile = {
-      identity: userId,
+      identity: localPeerId,
       name: userName,
       avatarUrl,
       isLocal: true,
@@ -596,7 +657,7 @@ export function useLiveKitRoom({
 
     const remoteTiles: LiveParticipantTile[] = [];
     session.peerMeta.forEach((meta, peerId) => {
-      if (peerId === userId) return;
+      if (peerId === localPeerId) return;
       const tracks = session.remoteTracks.get(peerId);
       const rAudio =
         tracks?.audioTrack && tracks.audioTrack.readyState === "live" ? tracks.audioTrack : null;
@@ -619,13 +680,13 @@ export function useLiveKitRoom({
         isScreenSharing: peerSharing,
         connectionQuality: rCam || rAudio || rScreen ? "good" : "unknown",
         videoTrack: meta.isVideoOff ? null : rCam,
-        audioTrack: meta.isMuted ? null : rAudio,
+        audioTrack: rAudio,
         screenTrack: peerSharing ? rScreen : null
       });
     });
 
     setTiles([localTile, ...remoteTiles]);
-  }, [avatarUrl, isHost, sessionKey, setTiles, userId, userName]);
+  }, [avatarUrl, isHost, localPeerId, sessionKey, setTiles, userName]);
 
   const replaceMeshRoleTrack = useCallback(
     async (role: "audio" | "camera" | "screen", nextTrack: MediaStreamTrack | null) => {
@@ -649,19 +710,10 @@ export function useLiveKitRoom({
     [sessionKey]
   );
 
-  // Kirim state instan lewat broadcast (<50ms) + sinkronisasi presence di background
   const broadcastMeshState = useCallback(() => {
     const session = getSession(sessionKey);
     if (!session.channel) return;
-    const meta: MeshPeerMeta = {
-      userId,
-      name: userName,
-      avatarUrl: avatarUrl || null,
-      isHost,
-      isMuted: session.isMuted,
-      isVideoOff: session.isVideoOff,
-      isScreenSharing: session.isScreenSharing && !session.isScreenPaused
-    };
+    const meta = buildLocalMeshMeta();
 
     void session.channel
       .send({
@@ -672,21 +724,13 @@ export function useLiveKitRoom({
       .catch(() => {});
 
     void session.channel.track(meta).catch(() => {});
-  }, [avatarUrl, isHost, sessionKey, userId, userName]);
+  }, [buildLocalMeshMeta, sessionKey]);
 
   const trackMeshPresence = useCallback(async () => {
     const session = getSession(sessionKey);
     if (!session.channel) return;
-    await session.channel.track({
-      userId,
-      name: userName,
-      avatarUrl: avatarUrl || null,
-      isHost,
-      isMuted: session.isMuted,
-      isVideoOff: session.isVideoOff,
-      isScreenSharing: session.isScreenSharing && !session.isScreenPaused
-    });
-  }, [avatarUrl, isHost, sessionKey, userId, userName]);
+    await session.channel.track(buildLocalMeshMeta()).catch(() => {});
+  }, [buildLocalMeshMeta, sessionKey]);
 
   const ensureLocalMedia = useCallback(async () => {
     const session = getSession(sessionKey);
@@ -764,7 +808,6 @@ export function useLiveKitRoom({
 
     try {
       await session.mediaInitPromise;
-      // Pasang track baru ke peer Mesh yang mungkin sudah tersambung lebih dulu
       if (!session.room && session.peerConnections.size > 0) {
         const aTrack = session.getRawAudioTrack();
         const cTrack = session.getEffectiveCameraTrack();
@@ -783,7 +826,6 @@ export function useLiveKitRoom({
     sessionKey
   ]);
 
-  // Publikasikan ulang track kamera ke LiveKit atau Mesh (mis. saat ganti efek background)
   const applyCameraTrackToTransport = useCallback(
     async (nextTrack: MediaStreamTrack | null) => {
       const session = getSession(sessionKey);
@@ -814,7 +856,6 @@ export function useLiveKitRoom({
     [replaceMeshRoleTrack, sessionKey, syncLiveKitTiles, syncMeshTiles]
   );
 
-  // Terapkan Background Kamera Effect (real-time Canvas -> WebRTC track)
   const setCameraEffect = useCallback(
     async (nextEffect: VideoEffectId) => {
       const session = getSession(sessionKey);
@@ -883,6 +924,7 @@ export function useLiveKitRoom({
     syncMeshTiles,
     trackMeshPresence,
     broadcastMeshState,
+    buildLocalMeshMeta,
     refreshDevices,
     pushNotification,
     unlockAudio,
@@ -895,6 +937,7 @@ export function useLiveKitRoom({
     syncMeshTiles,
     trackMeshPresence,
     broadcastMeshState,
+    buildLocalMeshMeta,
     refreshDevices,
     pushNotification,
     unlockAudio,
@@ -902,9 +945,9 @@ export function useLiveKitRoom({
     acquireVideoTrack
   };
 
-  // Langsung buka kamera & tampilkan preview lokal sejak awal tanpa menunggu connect/klik
+  // Langsung buka kamera & preview lokal sejak awal
   useEffect(() => {
-    if (!meetingCode || !userId) return;
+    if (!normalizedCode || !userId) return;
     let unmounted = false;
     const session = getSession(sessionKey);
 
@@ -920,14 +963,19 @@ export function useLiveKitRoom({
 
     void openCameraImmediately();
 
+    const onBeforeUnload = () => {
+      session.cleanupMesh(localPeerId);
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+
     return () => {
       unmounted = true;
-      session.cleanupAll();
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      session.cleanupAll(localPeerId);
       sessions.delete(sessionKey);
     };
-  }, [meetingCode, sessionKey, userId]);
+  }, [localPeerId, normalizedCode, sessionKey, userId]);
 
-  // Sinkronkan metadata user tanpa memutus koneksi
   useEffect(() => {
     const session = getSession(sessionKey);
     if (session.room) {
@@ -939,7 +987,7 @@ export function useLiveKitRoom({
   }, [avatarUrl, broadcastMeshState, isHost, sessionKey, syncLiveKitTiles, syncMeshTiles, userName]);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || !normalizedCode) return;
     let cancelled = false;
     const session = getSession(sessionKey);
 
@@ -964,7 +1012,6 @@ export function useLiveKitRoom({
       const camT = getTransceiverByRole(pc, "camera");
       const screenT = getTransceiverByRole(pc, "screen");
 
-      // Selalu pasang track yang hidup ke transceiver (dengan .enabled sesuai state) agar ON/OFF instan tanpa renegosiasi
       if (audioT) {
         audioT.direction = "sendrecv";
         if (audioTrack) {
@@ -990,7 +1037,18 @@ export function useLiveKitRoom({
       isInitiator: boolean
     ): RTCPeerConnection => {
       const existing = session.peerConnections.get(peerId);
-      if (existing) return existing;
+      if (existing && existing.connectionState !== "failed" && existing.connectionState !== "closed") {
+        return existing;
+      }
+
+      if (existing) {
+        try {
+          existing.close();
+        } catch {
+          // Ignore close error
+        }
+        session.peerConnections.delete(peerId);
+      }
 
       const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
       session.peerConnections.set(peerId, pc);
@@ -1003,12 +1061,12 @@ export function useLiveKitRoom({
 
       pc.onicecandidate = (event) => {
         if (event.candidate && session.channel) {
-          session.channel.send({
+          void session.channel.send({
             type: "broadcast",
             event: "webrtc-signal",
             payload: {
               to: peerId,
-              from: userId,
+              from: localPeerId,
               kind: "ice",
               candidate: event.candidate.toJSON()
             }
@@ -1054,10 +1112,94 @@ export function useLiveKitRoom({
           session.peerConnections.delete(peerId);
           session.remoteTracks.delete(peerId);
           callbacksRef.current.syncMeshTiles();
+
+          // Auto-reconnect jika peer masih ada di room
+          if (
+            !cancelled &&
+            pc.connectionState === "failed" &&
+            session.peerMeta.has(peerId) &&
+            localPeerId < peerId
+          ) {
+            setTimeout(() => {
+              if (!cancelled && session.peerMeta.has(peerId) && !session.peerConnections.has(peerId)) {
+                void initiateOfferToPeer(peerId);
+              }
+            }, 1500);
+          }
         }
       };
 
       return pc;
+    };
+
+    const initiateOfferToPeer = async (peerId: string) => {
+      if (cancelled || peerId === localPeerId || localPeerId >= peerId) return;
+      if (session.peerConnections.has(peerId) || !session.channel) return;
+
+      const pc = createMeshPeerConnection(peerId, true);
+      try {
+        await attachLocalTracksToTransceivers(pc);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await session.channel.send({
+          type: "broadcast",
+          event: "webrtc-signal",
+          payload: {
+            to: peerId,
+            from: localPeerId,
+            kind: "offer",
+            sdp: offer
+          }
+        });
+      } catch {
+        // Ignore transient negotiation error
+      }
+    };
+
+    const registerDiscoveredPeer = (meta: MeshPeerMeta, playChimeIfNew: boolean) => {
+      const peerId = meta.peerId || meta.userId;
+      if (!peerId || peerId === localPeerId) return;
+
+      const isNewPeer = !session.knownRemotePeers.has(peerId);
+      session.peerMeta.set(peerId, { ...meta, peerId });
+      session.peerLastSeen.set(peerId, Date.now());
+      session.knownRemotePeers.add(peerId);
+
+      if (isNewPeer && playChimeIfNew) {
+        playMeetingSound("join");
+      }
+
+      if (localPeerId < peerId && !session.peerConnections.has(peerId)) {
+        void initiateOfferToPeer(peerId);
+      }
+
+      callbacksRef.current.syncMeshTiles();
+      callbacksRef.current.unlockAudio();
+    };
+
+    const removePeer = (peerId: string, playChime: boolean) => {
+      if (!peerId || peerId === localPeerId) return;
+      const existed = session.peerMeta.has(peerId) || session.knownRemotePeers.has(peerId);
+
+      const pc = session.peerConnections.get(peerId);
+      if (pc) {
+        try {
+          pc.close();
+        } catch {
+          // Ignore close error
+        }
+        session.peerConnections.delete(peerId);
+      }
+      session.remoteTracks.delete(peerId);
+      session.peerMeta.delete(peerId);
+      session.peerLastSeen.delete(peerId);
+      session.pendingIce.delete(peerId);
+      session.knownRemotePeers.delete(peerId);
+
+      if (existed) {
+        if (playChime) playMeetingSound("leave");
+        callbacksRef.current.syncMeshTiles();
+      }
     };
 
     const startMultiUserMeshFallback = async (reason: string) => {
@@ -1070,9 +1212,9 @@ export function useLiveKitRoom({
       callbacksRef.current.syncMeshTiles();
 
       const supabase = createClient();
-      const channel = supabase.channel(`ramameet-mesh:${meetingCode}`, {
+      const channel = supabase.channel(`ramameet-mesh:${normalizedCode}`, {
         config: {
-          presence: { key: userId },
+          presence: { key: localPeerId },
           broadcast: { self: false }
         }
       });
@@ -1081,90 +1223,83 @@ export function useLiveKitRoom({
       let initialPresenceSynced = false;
 
       channel
-        .on("presence", { event: "sync" }, async () => {
+        .on("presence", { event: "sync" }, () => {
           const state = channel.presenceState<MeshPeerMeta>();
-          const activePeerIds = new Set<string>();
+          const presenceIds = new Set<string>();
 
           Object.entries(state).forEach(([key, entries]) => {
             const latest = entries[entries.length - 1];
             if (!latest) return;
-            activePeerIds.add(key);
-            const existingMeta = session.peerMeta.get(key);
-            // Jangan timpa state cepat jika presence belum ketinggalan, kecuali baru gabung
-            session.peerMeta.set(key, existingMeta ? { ...existingMeta, ...latest } : latest);
+            const peerId = latest.peerId || key;
+            presenceIds.add(peerId);
+            registerDiscoveredPeer({ ...latest, peerId }, initialPresenceSynced);
           });
 
-          // Deteksi peserta baru masuk / keluar untuk suara chime
-          if (initialPresenceSynced) {
-            let someoneJoined = false;
-            let someoneLeft = false;
-
-            activePeerIds.forEach((peerId) => {
-              if (peerId !== userId && !session.knownRemotePeers.has(peerId)) {
-                someoneJoined = true;
-              }
-            });
-            session.knownRemotePeers.forEach((peerId) => {
-              if (!activePeerIds.has(peerId)) {
-                someoneLeft = true;
-              }
-            });
-
-            if (someoneJoined) playMeetingSound("join");
-            else if (someoneLeft) playMeetingSound("leave");
+          // Hapus peer yang keluar dari presence dan sudah tidak kirim heartbeat > 12 detik
+          const now = Date.now();
+          for (const peerId of Array.from(session.peerMeta.keys())) {
+            if (peerId === localPeerId) continue;
+            const lastSeen = session.peerLastSeen.get(peerId) || 0;
+            if (!presenceIds.has(peerId) && now - lastSeen > 12000) {
+              removePeer(peerId, initialPresenceSynced);
+            }
           }
 
-          session.knownRemotePeers.clear();
-          activePeerIds.forEach((peerId) => {
-            if (peerId !== userId) session.knownRemotePeers.add(peerId);
-          });
           initialPresenceSynced = true;
-
-          for (const [peerId, pc] of Array.from(session.peerConnections.entries())) {
-            if (!activePeerIds.has(peerId)) {
-              pc.close();
-              session.peerConnections.delete(peerId);
-              session.remoteTracks.delete(peerId);
-              session.peerMeta.delete(peerId);
-            }
-          }
-
-          for (const peerId of Array.from(activePeerIds)) {
-            if (peerId === userId) continue;
-            if (userId < peerId && !session.peerConnections.has(peerId)) {
-              const pc = createMeshPeerConnection(peerId, true);
-              try {
-                await attachLocalTracksToTransceivers(pc);
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-                await channel.send({
-                  type: "broadcast",
-                  event: "webrtc-signal",
-                  payload: {
-                    to: peerId,
-                    from: userId,
-                    kind: "offer",
-                    sdp: offer
-                  }
-                });
-              } catch {
-                // Ignore transient negotiation error
-              }
-            }
-          }
-
           callbacksRef.current.syncMeshTiles();
         })
-        // Terima perubahan mute/kamera peserta lain secara instan (<50ms)
+        .on("presence", { event: "leave" }, ({ key, leftPresences }) => {
+          const peerId = (leftPresences?.[0] as MeshPeerMeta | undefined)?.peerId || key;
+          if (peerId && peerId !== localPeerId) {
+            removePeer(peerId, true);
+          }
+        })
+        // Handshake cepat saat peserta baru masuk (anti gagal deteksi jika presence telat)
+        .on("broadcast", { event: "peer-join" }, ({ payload }) => {
+          const meta = payload as MeshPeerMeta | undefined;
+          if (!meta) return;
+          const peerId = meta.peerId || meta.userId;
+          if (!peerId || peerId === localPeerId) return;
+
+          registerDiscoveredPeer({ ...meta, peerId }, true);
+
+          // Balas identitas kita langsung ke peserta baru tersebut
+          void channel.send({
+            type: "broadcast",
+            event: "peer-welcome",
+            payload: {
+              to: peerId,
+              meta: callbacksRef.current.buildLocalMeshMeta()
+            }
+          });
+        })
+        .on("broadcast", { event: "peer-welcome" }, ({ payload }) => {
+          if (!payload || (payload.to && payload.to !== localPeerId)) return;
+          const meta = payload.meta as MeshPeerMeta | undefined;
+          if (!meta) return;
+          const peerId = meta.peerId || meta.userId;
+          if (!peerId || peerId === localPeerId) return;
+
+          registerDiscoveredPeer({ ...meta, peerId }, false);
+        })
         .on("broadcast", { event: "peer-state" }, ({ payload }) => {
-          if (!payload || !payload.userId || payload.userId === userId) return;
-          session.peerMeta.set(payload.userId as string, payload as MeshPeerMeta);
-          callbacksRef.current.syncMeshTiles();
-          callbacksRef.current.unlockAudio();
+          const meta = payload as MeshPeerMeta | undefined;
+          if (!meta) return;
+          const peerId = meta.peerId || meta.userId;
+          if (!peerId || peerId === localPeerId) return;
+
+          registerDiscoveredPeer({ ...meta, peerId }, true);
+        })
+        .on("broadcast", { event: "peer-leave" }, ({ payload }) => {
+          const peerId = (payload?.peerId || payload?.userId) as string | undefined;
+          if (peerId && peerId !== localPeerId) {
+            removePeer(peerId, true);
+          }
         })
         .on("broadcast", { event: "webrtc-signal" }, async ({ payload }) => {
-          if (!payload || payload.to !== userId) return;
+          if (!payload || payload.to !== localPeerId) return;
           const fromId = payload.from as string;
+          if (!fromId || fromId === localPeerId) return;
 
           if (payload.kind === "offer") {
             const pc = createMeshPeerConnection(fromId, false);
@@ -1185,7 +1320,7 @@ export function useLiveKitRoom({
                 event: "webrtc-signal",
                 payload: {
                   to: fromId,
-                  from: userId,
+                  from: localPeerId,
                   kind: "answer",
                   sdp: answer
                 }
@@ -1222,7 +1357,35 @@ export function useLiveKitRoom({
         .subscribe(async (status) => {
           if (status === "SUBSCRIBED" && !cancelled) {
             triggerJoinChimeOnce();
+            const myMeta = callbacksRef.current.buildLocalMeshMeta();
             await callbacksRef.current.trackMeshPresence();
+
+            // Umumkan kehadiran langsung ke semua peserta di room
+            void channel.send({
+              type: "broadcast",
+              event: "peer-join",
+              payload: myMeta
+            });
+
+            // Heartbeat ringan setiap 5 detik agar sinkronisasi peserta selalu akurat
+            if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
+            session.heartbeatTimer = setInterval(() => {
+              if (cancelled || !session.channel) return;
+              void session.channel
+                .send({
+                  type: "broadcast",
+                  event: "peer-state",
+                  payload: callbacksRef.current.buildLocalMeshMeta()
+                })
+                .catch(() => {});
+
+              const now = Date.now();
+              for (const [peerId, lastSeen] of Array.from(session.peerLastSeen.entries())) {
+                if (now - lastSeen > 20000) {
+                  removePeer(peerId, true);
+                }
+              }
+            }, 5000);
           }
         });
     };
@@ -1234,7 +1397,7 @@ export function useLiveKitRoom({
 
       if (!token || !serverUrl) {
         await startMultiUserMeshFallback(
-          "Mode Multi-User WebRTC Mesh aktif (Kamera + Efek + Share Screen simultan)."
+          "Mode Multi-User WebRTC Mesh aktif (Kamera + Suara + Share Screen simultan)."
         );
         return;
       }
@@ -1299,14 +1462,26 @@ export function useLiveKitRoom({
 
       try {
         setConnectionState("connecting");
-        await room.connect(serverUrl, token);
+        // Batas waktu 5 detik agar jika SFU tidak aktif langsung pindah ke Mesh bersama-sama
+        let timeoutId: ReturnType<typeof setTimeout> | null = null;
+        const connectPromise = room.connect(serverUrl, token);
+        connectPromise.catch(() => {});
+
+        await Promise.race([
+          connectPromise,
+          new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error("LiveKit connect timeout")), 5000);
+          })
+        ]).finally(() => {
+          if (timeoutId) clearTimeout(timeoutId);
+        });
+
         if (cancelled) {
           room.disconnect();
           return;
         }
         setSfuNotice(null);
 
-        // Buka playback suara & bunyikan chime masuk meeting bergaya Google Meet
         void room.startAudio().catch(() => {});
         triggerJoinChimeOnce();
 
@@ -1368,11 +1543,10 @@ export function useLiveKitRoom({
 
     return () => {
       cancelled = true;
-      session.cleanupTransport();
+      session.cleanupTransport(localPeerId);
     };
-  }, [enabled, meetingCode, token, serverUrl, userId, sessionKey]);
+  }, [enabled, localPeerId, normalizedCode, token, serverUrl, sessionKey]);
 
-  // Eksekutor antrean mikrofon: tahan spam-klik, 0ms UI response, selalu sinkron ke semua user
   const syncDesiredMicState = useCallback(async () => {
     const session = getSession(sessionKey);
     if (session.micProcessing) return;
@@ -1479,7 +1653,6 @@ export function useLiveKitRoom({
     syncMeshTiles
   ]);
 
-  // Toggle Microphone instan (tidak pernah nyangkut atau butuh klik berulang)
   const toggleMute = useCallback(async () => {
     const session = getSession(sessionKey);
     unlockAudio();
@@ -1489,7 +1662,6 @@ export function useLiveKitRoom({
     session.isMuted = nextMuted;
     setIsMuted(nextMuted);
 
-    // Ubah hardware track & tampilan seketika (0ms delay)
     const rawAudio = session.getRawAudioTrack();
     if (rawAudio) rawAudio.enabled = !nextMuted;
     playMeetingSound(nextMuted ? "toggle-off" : "toggle-on");
@@ -1528,7 +1700,6 @@ export function useLiveKitRoom({
     await syncDesiredMicState();
   }, [broadcastMeshState, sessionKey, syncDesiredMicState, syncLiveKitTiles, syncMeshTiles]);
 
-  // Eksekutor antrean kamera: keep-warm track (ON/OFF 0ms instan, anti bug klik berulang)
   const syncDesiredVideoState = useCallback(async () => {
     const session = getSession(sessionKey);
     if (session.camProcessing) return;
@@ -1612,7 +1783,6 @@ export function useLiveKitRoom({
               if (camPub.isMuted) {
                 await camPub.track.unmute().catch(() => {});
               }
-              // Jika SDK sempat menghentikan track saat mute sebelumnya, publikasikan ulang track aktif
               if (camPub.track.mediaStreamTrack.readyState !== "live" && effectiveTrack) {
                 await Promise.resolve(
                   session.room.localParticipant.unpublishTrack(camPub.track, false)
@@ -1660,7 +1830,6 @@ export function useLiveKitRoom({
     syncMeshTiles
   ]);
 
-  // Toggle Camera instan (1 klik langsung OFF / 1 klik langsung ON tanpa delay)
   const toggleVideo = useCallback(async () => {
     const session = getSession(sessionKey);
     unlockAudio();
@@ -1670,7 +1839,6 @@ export function useLiveKitRoom({
     session.isVideoOff = nextVideoOff;
     setIsVideoOff(nextVideoOff);
 
-    // Respon lokal & hardware instan (0ms delay)
     const rawCam = session.getRawCameraTrack();
     if (rawCam) rawCam.enabled = !nextVideoOff;
     if (session.effectProcessor) session.effectProcessor.setPaused(nextVideoOff);
@@ -1711,7 +1879,6 @@ export function useLiveKitRoom({
     broadcastMeshState();
   }, [broadcastMeshState, replaceMeshRoleTrack, sessionKey, syncMeshTiles]);
 
-  // Pause / Resume Share Screen
   const togglePauseScreenShare = useCallback(async () => {
     const session = getSession(sessionKey);
     if (!session.isScreenSharing) return;
@@ -1742,7 +1909,6 @@ export function useLiveKitRoom({
     broadcastMeshState();
   }, [broadcastMeshState, replaceMeshRoleTrack, sessionKey, syncLiveKitTiles, syncMeshTiles]);
 
-  // Share Screen 1-Klik ON / 1-Klik OFF langsung
   const toggleScreenShare = useCallback(async () => {
     const session = getSession(sessionKey);
     if (session.screenLock) return;
@@ -1750,7 +1916,6 @@ export function useLiveKitRoom({
 
     session.screenLock = true;
     try {
-      // 1-KLIK OFF: jika sedang share screen (termasuk saat pause), langsung matikan total
       if (session.isScreenSharing) {
         if (session.room) {
           await session.room.localParticipant.setScreenShareEnabled(false).catch(() => {});
@@ -1779,7 +1944,6 @@ export function useLiveKitRoom({
         return;
       }
 
-      // 1-KLIK ON
       if (typeof window !== "undefined" && !window.isSecureContext) {
         pushNotification({
           title: "HTTPS Diperlukan",
@@ -1792,7 +1956,7 @@ export function useLiveKitRoom({
       if (!navigator.mediaDevices?.getDisplayMedia) {
         pushNotification({
           title: "Browser Tidak Mendukung",
-          message: "Perangkat/browser ini tidak mendukung Share Screen.",
+          message: "Share Screen di web hanya didukung di Desktop atau Chrome Android terbaru.",
           type: "warning"
         });
         return;
@@ -1815,11 +1979,8 @@ export function useLiveKitRoom({
           } catch (audioErr: any) {
             if (audioErr?.name === "NotAllowedError" || audioErr?.name === "AbortError") return;
             pub = await session.room.localParticipant.setScreenShareEnabled(true, {
-              audio: false,
-              contentHint: "detail",
-              selfBrowserSurface: "exclude",
-              surfaceSwitching: "include"
-            } as any);
+              audio: false
+            });
           }
 
           const publishedTrack = pub?.track?.mediaStreamTrack;
@@ -2020,13 +2181,13 @@ export function useLiveKitRoom({
   const disconnect = useCallback(() => {
     const session = getSession(sessionKey);
     playMeetingSound("leave");
-    session.cleanupAll();
+    session.cleanupAll(localPeerId);
     sessions.delete(sessionKey);
     setIsScreenSharing(false);
     setIsScreenPaused(false);
     setCameraEffectState("none");
     setTiles([]);
-  }, [sessionKey, setTiles]);
+  }, [localPeerId, sessionKey, setTiles]);
 
   return {
     connectionState,
