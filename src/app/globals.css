@@ -45,3 +45,15 @@ body {
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
 }
+
+/* Ruang scroll bawah di mode Android/HP agar tidak ketutup navigasi bawah */
+@media (max-width: 767px) {
+  html,
+  body {
+    height: 100dvh;
+  }
+
+  main {
+    padding-bottom: calc(6.5rem + env(safe-area-inset-bottom)) !important;
+  }
+}
