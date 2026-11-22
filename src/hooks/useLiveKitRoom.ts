@@ -16,6 +16,9 @@ import { useMeetingStore } from "@/stores/useMeetingStore";
 import { createClient } from "@/lib/supabase/client";
 import { VideoEffectProcessor, type VideoEffectId } from "@/utils/videoEffects";
 
+const CUSTOM_BG_STORAGE_KEY = "ramameet_custom_bg";
+const MAX_BG_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+
 interface UseLiveKitRoomOptions {
   meetingCode: string;
   token: string | null;
@@ -70,6 +73,18 @@ const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
 
 let sharedAudioCtx: AudioContext | null = null;
 let pendingJoinSound = false;
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") resolve(reader.result);
+      else reject(new Error("Gagal membaca file gambar."));
+    };
+    reader.onerror = () => reject(new Error("Gagal membaca file gambar."));
+    reader.readAsDataURL(file);
+  });
+}
 
 function getClientPeerId(userId: string): string {
   if (typeof window === "undefined") return userId;
@@ -131,12 +146,10 @@ function playMeetingSound(kind: MeetingSoundKind) {
   const trigger = () => {
     try {
       if (kind === "join") {
-        // Suara chime jernih bergaya Zoom / Google Meet saat masuk atau peserta bergabung
         scheduleTone(ctx, 523.25, 0, 0.24, 0.32, "sine");
         scheduleTone(ctx, 659.25, 0.09, 0.28, 0.3, "sine");
         scheduleTone(ctx, 783.99, 0.19, 0.38, 0.28, "triangle");
       } else if (kind === "leave") {
-        // Suara chime menurun saat keluar meeting
         scheduleTone(ctx, 659.25, 0, 0.2, 0.26, "sine");
         scheduleTone(ctx, 440.0, 0.12, 0.3, 0.24, "sine");
       } else if (kind === "toggle-on") {
@@ -175,6 +188,7 @@ class MeshSession {
   mediaInitPromise: Promise<void> | null = null;
   effectProcessor: VideoEffectProcessor | null = null;
   cameraEffect: VideoEffectId = "none";
+  customBackgroundUrl: string | null = null;
   channel: RealtimeChannel | null = null;
   heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   peerConnections = new Map<string, RTCPeerConnection>();
@@ -386,12 +400,28 @@ export function useLiveKitRoom({
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [isScreenPaused, setIsScreenPaused] = useState(false);
   const [cameraEffect, setCameraEffectState] = useState<VideoEffectId>("none");
+  const [customBackgroundUrl, setCustomBackgroundUrl] = useState<string | null>(null);
   const [micBusy, setMicBusy] = useState(false);
   const [camBusy, setCamBusy] = useState(false);
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedAudioId, setSelectedAudioId] = useState<string>("");
   const [selectedVideoId, setSelectedVideoId] = useState<string>("");
+
+  // Muat custom background yang sebelumnya pernah di-upload
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const saved = window.localStorage.getItem(CUSTOM_BG_STORAGE_KEY);
+      if (saved) {
+        const session = getSession(sessionKey);
+        session.customBackgroundUrl = saved;
+        setCustomBackgroundUrl(saved);
+      }
+    } catch {
+      // Ignore storage access errors
+    }
+  }, [sessionKey]);
 
   const unlockAudio = useCallback(() => {
     const session = getSession(sessionKey);
@@ -901,11 +931,18 @@ export function useLiveKitRoom({
 
         if (rawCam) {
           if (session.effectProcessor) {
+            if (session.customBackgroundUrl) {
+              session.effectProcessor.setCustomBackground(session.customBackgroundUrl);
+            }
             session.effectProcessor.setEffect(nextEffect);
             session.effectProcessor.setPaused(session.isVideoOff);
             await applyCameraTrackToTransport(session.effectProcessor.getTrack());
           } else {
-            session.effectProcessor = new VideoEffectProcessor(rawCam, nextEffect);
+            session.effectProcessor = new VideoEffectProcessor(
+              rawCam,
+              nextEffect,
+              session.customBackgroundUrl
+            );
             session.effectProcessor.setPaused(session.isVideoOff);
             await applyCameraTrackToTransport(session.effectProcessor.getTrack());
           }
@@ -917,6 +954,80 @@ export function useLiveKitRoom({
     },
     [acquireVideoTrack, applyCameraTrackToTransport, pushNotification, selectedVideoId, sessionKey]
   );
+
+  // Upload & langsung terapkan background gambar custom
+  const uploadBackgroundImage = useCallback(
+    async (file: File) => {
+      if (!file.type.startsWith("image/")) {
+        pushNotification({
+          title: "Format File Tidak Didukung",
+          message: "Pilih file gambar dengan format PNG, JPG, atau WEBP.",
+          type: "warning"
+        });
+        return;
+      }
+
+      if (file.size > MAX_BG_FILE_SIZE_BYTES) {
+        pushNotification({
+          title: "Ukuran Gambar Terlalu Besar",
+          message: "Ukuran maksimal background gambar adalah 5 MB.",
+          type: "warning"
+        });
+        return;
+      }
+
+      try {
+        const dataUrl = await readFileAsDataUrl(file);
+        const session = getSession(sessionKey);
+        session.customBackgroundUrl = dataUrl;
+        setCustomBackgroundUrl(dataUrl);
+
+        if (typeof window !== "undefined") {
+          try {
+            window.localStorage.setItem(CUSTOM_BG_STORAGE_KEY, dataUrl);
+          } catch {
+            // Abaikan jika melebihi kuota localStorage
+          }
+        }
+
+        session.effectProcessor?.setCustomBackground(dataUrl);
+        await setCameraEffect("custom");
+
+        pushNotification({
+          title: "Background Terpasang",
+          message: "Foto background berhasil di-upload dan diterapkan ke kamera.",
+          type: "success"
+        });
+      } catch {
+        pushNotification({
+          title: "Upload Gagal",
+          message: "Gagal memproses file gambar background.",
+          type: "error"
+        });
+      }
+    },
+    [pushNotification, sessionKey, setCameraEffect]
+  );
+
+  // Hapus background gambar custom
+  const clearCustomBackground = useCallback(async () => {
+    const session = getSession(sessionKey);
+    session.customBackgroundUrl = null;
+    setCustomBackgroundUrl(null);
+    session.effectProcessor?.setCustomBackground(null);
+
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.removeItem(CUSTOM_BG_STORAGE_KEY);
+      } catch {
+        // Ignore storage error
+      }
+    }
+
+    if (session.cameraEffect === "custom") {
+      await setCameraEffect("none");
+    }
+  }, [sessionKey, setCameraEffect]);
 
   const callbacksRef = useRef({
     ensureLocalMedia,
@@ -1113,7 +1224,6 @@ export function useLiveKitRoom({
           session.remoteTracks.delete(peerId);
           callbacksRef.current.syncMeshTiles();
 
-          // Auto-reconnect jika peer masih ada di room
           if (
             !cancelled &&
             pc.connectionState === "failed" &&
@@ -1235,7 +1345,6 @@ export function useLiveKitRoom({
             registerDiscoveredPeer({ ...latest, peerId }, initialPresenceSynced);
           });
 
-          // Hapus peer yang keluar dari presence dan sudah tidak kirim heartbeat > 12 detik
           const now = Date.now();
           for (const peerId of Array.from(session.peerMeta.keys())) {
             if (peerId === localPeerId) continue;
@@ -1255,7 +1364,6 @@ export function useLiveKitRoom({
             removePeer(peerId, true);
           }
         })
-        // Handshake cepat saat peserta baru masuk (anti gagal deteksi jika presence telat)
         .on("broadcast", { event: "peer-join" }, ({ payload }) => {
           const meta = payload as unknown as MeshPeerMeta | undefined;
           if (!meta) return;
@@ -1264,7 +1372,6 @@ export function useLiveKitRoom({
 
           registerDiscoveredPeer({ ...meta, peerId }, true);
 
-          // Balas identitas kita langsung ke peserta baru tersebut
           void channel.send({
             type: "broadcast",
             event: "peer-welcome",
@@ -1361,14 +1468,12 @@ export function useLiveKitRoom({
             const myMeta = callbacksRef.current.buildLocalMeshMeta();
             await callbacksRef.current.trackMeshPresence();
 
-            // Umumkan kehadiran langsung ke semua peserta di room
             void channel.send({
               type: "broadcast",
               event: "peer-join",
               payload: myMeta
             });
 
-            // Heartbeat ringan setiap 5 detik agar sinkronisasi peserta selalu akurat
             if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
             session.heartbeatTimer = setInterval(() => {
               if (cancelled || !session.channel) return;
@@ -1463,7 +1568,6 @@ export function useLiveKitRoom({
 
       try {
         setConnectionState("connecting");
-        // Batas waktu 5 detik agar jika SFU tidak aktif langsung pindah ke Mesh bersama-sama
         let timeoutId: ReturnType<typeof setTimeout> | null = null;
         const connectPromise = room.connect(serverUrl, token);
         connectPromise.catch(() => {});
@@ -1762,7 +1866,11 @@ export function useLiveKitRoom({
             const processedTrack = session.effectProcessor?.getTrack();
             if (!session.effectProcessor || !processedTrack || processedTrack.readyState !== "live") {
               session.destroyEffectProcessor();
-              session.effectProcessor = new VideoEffectProcessor(rawCam, session.cameraEffect);
+              session.effectProcessor = new VideoEffectProcessor(
+                rawCam,
+                session.cameraEffect,
+                session.customBackgroundUrl
+              );
             }
             session.effectProcessor.setPaused(false);
           }
@@ -2164,7 +2272,11 @@ export function useLiveKitRoom({
 
       if (session.cameraEffect !== "none") {
         session.destroyEffectProcessor();
-        session.effectProcessor = new VideoEffectProcessor(newTrack, session.cameraEffect);
+        session.effectProcessor = new VideoEffectProcessor(
+          newTrack,
+          session.cameraEffect,
+          session.customBackgroundUrl
+        );
         session.effectProcessor.setPaused(session.isVideoOff);
       }
       await applyCameraTrackToTransport(session.getEffectiveCameraTrack());
@@ -2199,6 +2311,7 @@ export function useLiveKitRoom({
     isScreenSharing,
     isScreenPaused,
     cameraEffect,
+    customBackgroundUrl,
     micBusy,
     camBusy,
     audioDevices,
@@ -2211,6 +2324,8 @@ export function useLiveKitRoom({
     toggleScreenShare,
     togglePauseScreenShare,
     setCameraEffect,
+    uploadBackgroundImage,
+    clearCustomBackground,
     switchAudioDevice,
     switchVideoDevice,
     disconnect

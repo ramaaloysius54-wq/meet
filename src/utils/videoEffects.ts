@@ -4,7 +4,8 @@ export type VideoEffectId =
   | "blur-strong"
   | "studio-blue"
   | "warm-studio"
-  | "mono";
+  | "mono"
+  | "custom";
 
 export const VIDEO_EFFECT_OPTIONS: {
   id: VideoEffectId;
@@ -21,7 +22,7 @@ export const VIDEO_EFFECT_OPTIONS: {
 
 /**
  * Memproses raw camera MediaStreamTrack via Canvas 30fps
- * sehingga efek background terkirim ke peserta lain (LiveKit & Mesh).
+ * sehingga efek & custom background image terkirim ke peserta lain (LiveKit & Mesh).
  */
 export class VideoEffectProcessor {
   private video: HTMLVideoElement;
@@ -34,8 +35,14 @@ export class VideoEffectProcessor {
   private outputTrack: MediaStreamTrack;
   private effect: VideoEffectId;
   private paused = false;
+  private customBgImage: HTMLImageElement | null = null;
+  private customBgUrl: string | null = null;
 
-  constructor(rawTrack: MediaStreamTrack, effect: VideoEffectId) {
+  constructor(
+    rawTrack: MediaStreamTrack,
+    effect: VideoEffectId,
+    customBgUrl?: string | null
+  ) {
     this.effect = effect;
 
     const settings = rawTrack.getSettings();
@@ -63,6 +70,10 @@ export class VideoEffectProcessor {
     if (!mCtx) throw new Error("Mask Canvas 2D context tidak tersedia");
     this.maskCtx = mCtx;
 
+    if (customBgUrl) {
+      this.setCustomBackground(customBgUrl);
+    }
+
     this.outputStream = this.canvas.captureStream(30);
     this.outputTrack = this.outputStream.getVideoTracks()[0];
 
@@ -78,9 +89,51 @@ export class VideoEffectProcessor {
     this.effect = effect;
   }
 
+  setCustomBackground(imageUrl: string | null) {
+    this.customBgUrl = imageUrl;
+    if (!imageUrl) {
+      this.customBgImage = null;
+      return;
+    }
+
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      if (this.customBgUrl === imageUrl) {
+        this.customBgImage = img;
+      }
+    };
+    img.onerror = () => {
+      if (this.customBgUrl === imageUrl) {
+        this.customBgImage = null;
+      }
+    };
+    img.src = imageUrl;
+  }
+
   setPaused(paused: boolean) {
     this.paused = paused;
     this.outputTrack.enabled = !paused;
+  }
+
+  private drawImageCover(img: HTMLImageElement, w: number, h: number) {
+    const imgRatio = img.naturalWidth / Math.max(img.naturalHeight, 1);
+    const canvasRatio = w / Math.max(h, 1);
+
+    let drawWidth = w;
+    let drawHeight = h;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (imgRatio > canvasRatio) {
+      drawWidth = h * imgRatio;
+      offsetX = (w - drawWidth) / 2;
+    } else {
+      drawHeight = w / imgRatio;
+      offsetY = (h - drawHeight) / 2;
+    }
+
+    this.ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
   }
 
   private renderFrame() {
@@ -108,8 +161,16 @@ export class VideoEffectProcessor {
       return;
     }
 
-    // 1. Gambar lapisan latar belakang dengan blur + tone warna
-    if (this.effect === "blur-soft") {
+    // 1. Gambar lapisan latar belakang
+    if (this.effect === "custom") {
+      if (this.customBgImage && this.customBgImage.complete && this.customBgImage.naturalWidth > 0) {
+        ctx.filter = "none";
+        this.drawImageCover(this.customBgImage, w, h);
+      } else {
+        ctx.filter = "blur(18px) brightness(0.55)";
+        ctx.drawImage(this.video, 0, 0, w, h);
+      }
+    } else if (this.effect === "blur-soft") {
       ctx.filter = "blur(10px) brightness(0.95)";
       ctx.drawImage(this.video, 0, 0, w, h);
     } else if (this.effect === "blur-strong") {
@@ -129,7 +190,14 @@ export class VideoEffectProcessor {
       ctx.filter = "blur(18px) brightness(0.62) sepia(0.25)";
       ctx.drawImage(this.video, 0, 0, w, h);
       ctx.filter = "none";
-      const warmGrad = ctx.createRadialGradient(w * 0.5, h * 0.35, w * 0.1, w * 0.5, h * 0.5, w * 0.8);
+      const warmGrad = ctx.createRadialGradient(
+        w * 0.5,
+        h * 0.35,
+        w * 0.1,
+        w * 0.5,
+        h * 0.5,
+        w * 0.8
+      );
       warmGrad.addColorStop(0, "rgba(251, 191, 36, 0.18)");
       warmGrad.addColorStop(1, "rgba(15, 23, 42, 0.65)");
       ctx.fillStyle = warmGrad;
@@ -144,8 +212,8 @@ export class VideoEffectProcessor {
       this.effect === "studio-blue"
         ? "contrast(1.05) brightness(1.04)"
         : this.effect === "warm-studio"
-          ? "contrast(1.03) saturate(1.06)"
-          : "none";
+        ? "contrast(1.03) saturate(1.06)"
+        : "none";
     mCtx.drawImage(this.video, 0, 0, w, h);
 
     mCtx.globalCompositeOperation = "destination-in";
@@ -174,6 +242,8 @@ export class VideoEffectProcessor {
       window.clearInterval(this.timerId);
       this.timerId = null;
     }
+    this.customBgImage = null;
+    this.customBgUrl = null;
     this.outputTrack.stop();
     this.video.pause();
     this.video.srcObject = null;
