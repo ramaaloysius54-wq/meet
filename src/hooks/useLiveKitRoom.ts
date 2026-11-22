@@ -1249,14 +1249,15 @@ export function useLiveKitRoom({
           callbacksRef.current.syncMeshTiles();
         })
         .on("presence", { event: "leave" }, ({ key, leftPresences }) => {
-          const peerId = (leftPresences?.[0] as MeshPeerMeta | undefined)?.peerId || key;
+          const firstLeft = leftPresences?.[0] as unknown as Partial<MeshPeerMeta> | undefined;
+          const peerId = firstLeft?.peerId || key;
           if (peerId && peerId !== localPeerId) {
             removePeer(peerId, true);
           }
         })
         // Handshake cepat saat peserta baru masuk (anti gagal deteksi jika presence telat)
         .on("broadcast", { event: "peer-join" }, ({ payload }) => {
-          const meta = payload as MeshPeerMeta | undefined;
+          const meta = payload as unknown as MeshPeerMeta | undefined;
           if (!meta) return;
           const peerId = meta.peerId || meta.userId;
           if (!peerId || peerId === localPeerId) return;
@@ -1275,7 +1276,7 @@ export function useLiveKitRoom({
         })
         .on("broadcast", { event: "peer-welcome" }, ({ payload }) => {
           if (!payload || (payload.to && payload.to !== localPeerId)) return;
-          const meta = payload.meta as MeshPeerMeta | undefined;
+          const meta = payload.meta as unknown as MeshPeerMeta | undefined;
           if (!meta) return;
           const peerId = meta.peerId || meta.userId;
           if (!peerId || peerId === localPeerId) return;
@@ -1283,7 +1284,7 @@ export function useLiveKitRoom({
           registerDiscoveredPeer({ ...meta, peerId }, false);
         })
         .on("broadcast", { event: "peer-state" }, ({ payload }) => {
-          const meta = payload as MeshPeerMeta | undefined;
+          const meta = payload as unknown as MeshPeerMeta | undefined;
           if (!meta) return;
           const peerId = meta.peerId || meta.userId;
           if (!peerId || peerId === localPeerId) return;
