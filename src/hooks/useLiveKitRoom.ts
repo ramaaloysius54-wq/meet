@@ -1,7 +1,7 @@
 "use client";
 // @refresh reset
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ConnectionQuality,
   ConnectionState,
@@ -49,7 +49,7 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun2.l.google.com:19302" }
 ];
 
-const AUDIO_CONSTRAINTS = {
+const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: true,
   autoGainControl: true
@@ -222,6 +222,92 @@ export function useLiveKitRoom({
   const [selectedAudioId, setSelectedAudioId] = useState<string>("");
   const [selectedVideoId, setSelectedVideoId] = useState<string>("");
 
+  const unlockAudio = useCallback(() => {
+    const session = getSession(sessionKey);
+    if (session.room) {
+      void session.room.startAudio().catch(() => {});
+    }
+    if (typeof document !== "undefined") {
+      document.querySelectorAll("audio").forEach((el) => {
+        if (el.srcObject && el.paused && !el.muted) {
+          void el.play().catch(() => {});
+        }
+      });
+    }
+  }, [sessionKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleGesture = () => unlockAudio();
+    window.addEventListener("pointerdown", handleGesture, { passive: true });
+    window.addEventListener("keydown", handleGesture, { passive: true });
+    return () => {
+      window.removeEventListener("pointerdown", handleGesture);
+      window.removeEventListener("keydown", handleGesture);
+    };
+  }, [unlockAudio]);
+
+  const acquireAudioTrack = useCallback(
+    async (deviceId?: string): Promise<MediaStreamTrack | null> => {
+      if (!navigator.mediaDevices?.getUserMedia) return null;
+      const attempts: MediaStreamConstraints[] = [];
+      if (deviceId) {
+        attempts.push({ audio: { ...AUDIO_CONSTRAINTS, deviceId: { ideal: deviceId } } });
+      }
+      attempts.push({ audio: AUDIO_CONSTRAINTS });
+      attempts.push({ audio: true });
+
+      for (const constraints of attempts) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          const track = stream.getAudioTracks()[0] || null;
+          if (track) {
+            track.enabled = true;
+            return track;
+          }
+        } catch {
+          // Try next fallback constraint
+        }
+      }
+      return null;
+    },
+    []
+  );
+
+  const acquireVideoTrack = useCallback(
+    async (deviceId?: string): Promise<MediaStreamTrack | null> => {
+      if (!navigator.mediaDevices?.getUserMedia) return null;
+      const attempts: MediaStreamConstraints[] = [];
+      if (deviceId) {
+        attempts.push({
+          video: {
+            width: VIDEO_CONSTRAINTS.width,
+            height: VIDEO_CONSTRAINTS.height,
+            frameRate: VIDEO_CONSTRAINTS.frameRate,
+            deviceId: { ideal: deviceId }
+          }
+        });
+      }
+      attempts.push({ video: VIDEO_CONSTRAINTS });
+      attempts.push({ video: true });
+
+      for (const constraints of attempts) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          const track = stream.getVideoTracks()[0] || null;
+          if (track) {
+            track.enabled = true;
+            return track;
+          }
+        } catch {
+          // Try next fallback constraint
+        }
+      }
+      return null;
+    },
+    []
+  );
+
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
     try {
@@ -255,8 +341,22 @@ export function useLiveKitRoom({
       const scrPub = p.getTrackPublication(Track.Source.ScreenShare);
       const scrAudioPub = p.getTrackPublication(Track.Source.ScreenShareAudio);
 
+      const pubCamTrack = camPub?.track?.mediaStreamTrack || null;
       const camTrack =
-        camPub?.track?.mediaStreamTrack || (local ? session.getEffectiveCameraTrack() : null);
+        pubCamTrack && pubCamTrack.readyState === "live"
+          ? pubCamTrack
+          : local && !session.isVideoOff
+          ? session.getEffectiveCameraTrack()
+          : null;
+
+      const pubMicTrack = micPub?.track?.mediaStreamTrack || null;
+      const micTrack =
+        pubMicTrack && pubMicTrack.readyState === "live"
+          ? pubMicTrack
+          : local
+          ? session.getRawAudioTrack()
+          : null;
+
       const scrTrack = scrPub?.track?.mediaStreamTrack || null;
       const hasActiveScreen = Boolean(
         scrTrack &&
@@ -265,18 +365,31 @@ export function useLiveKitRoom({
           !(local && session.isScreenPaused)
       );
 
-      const mutedState = micPub ? micPub.isMuted : local ? session.isMuted : true;
-      const videoOffState = camPub
+      const mutedState = local
+        ? session.micLock
+          ? session.isMuted
+          : session.isMuted || !micTrack || !micTrack.enabled || Boolean(micPub?.isMuted)
+        : micPub
+        ? micPub.isMuted
+        : true;
+
+      const videoOffState = local
+        ? session.camLock
+          ? session.isVideoOff
+          : session.isVideoOff || !camTrack || !camTrack.enabled || Boolean(camPub?.isMuted)
+        : camPub
         ? camPub.isMuted || !camTrack
-        : local
-        ? session.isVideoOff || !camTrack
         : true;
 
       if (local) {
-        session.isMuted = mutedState;
-        session.isVideoOff = videoOffState;
-        setIsMuted(mutedState);
-        setIsVideoOff(videoOffState);
+        if (!session.micLock) {
+          session.isMuted = mutedState;
+          setIsMuted(mutedState);
+        }
+        if (!session.camLock) {
+          session.isVideoOff = videoOffState;
+          setIsVideoOff(videoOffState);
+        }
       }
 
       return {
@@ -291,7 +404,7 @@ export function useLiveKitRoom({
         isScreenSharing: hasActiveScreen,
         connectionQuality: mapQuality(p.connectionQuality),
         videoTrack: !videoOffState ? camTrack : null,
-        audioTrack: micPub?.track?.mediaStreamTrack || (local ? session.getRawAudioTrack() : null),
+        audioTrack: micTrack,
         screenTrack: hasActiveScreen ? scrTrack : null,
         screenAudioTrack: hasActiveScreen ? scrAudioPub?.track?.mediaStreamTrack || null : null
       };
@@ -335,9 +448,9 @@ export function useLiveKitRoom({
       avatarUrl,
       isLocal: true,
       isHost,
-      isMuted: session.isMuted || !aTrack,
-      isVideoOff: session.isVideoOff || !vTrack,
-      isSpeaking: !session.isMuted && Boolean(aTrack),
+      isMuted: session.isMuted || !aTrack || !aTrack.enabled,
+      isVideoOff: session.isVideoOff || !vTrack || !vTrack.enabled,
+      isSpeaking: !session.isMuted && Boolean(aTrack && aTrack.enabled),
       isScreenSharing: screenActive,
       connectionQuality: "excellent",
       videoTrack: session.isVideoOff ? null : vTrack,
@@ -381,7 +494,7 @@ export function useLiveKitRoom({
 
   const ensureLocalMedia = useCallback(async () => {
     const session = getSession(sessionKey);
-    if (session.getRawCameraTrack() || session.getRawAudioTrack()) {
+    if (session.getRawCameraTrack() && session.getRawAudioTrack()) {
       return;
     }
 
@@ -393,43 +506,53 @@ export function useLiveKitRoom({
     session.mediaInitPromise = (async () => {
       if (!navigator.mediaDevices?.getUserMedia) return;
 
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: AUDIO_CONSTRAINTS,
-          video: VIDEO_CONSTRAINTS
-        });
-        session.localMediaStream = stream;
-        session.isMuted = false;
-        session.isVideoOff = false;
-        setIsMuted(false);
-        setIsVideoOff(false);
-        await refreshDevices();
-        return;
-      } catch {
-        // Fallback terpisah: kamera saja atau audio saja
+      if (!session.getRawCameraTrack() && !session.getRawAudioTrack()) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: AUDIO_CONSTRAINTS,
+            video: VIDEO_CONSTRAINTS
+          });
+          stream.getAudioTracks().forEach((t) => {
+            t.enabled = true;
+          });
+          stream.getVideoTracks().forEach((t) => {
+            t.enabled = true;
+          });
+          session.localMediaStream = stream;
+          session.isMuted = false;
+          session.isVideoOff = false;
+          setIsMuted(false);
+          setIsVideoOff(false);
+          await refreshDevices();
+          return;
+        } catch {
+          // Fallback terpisah: kamera saja atau audio saja
+        }
       }
 
-      const combined = new MediaStream();
-      let gotAudio = false;
-      let gotVideo = false;
-
-      try {
-        const vStream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
-        vStream.getVideoTracks().forEach((t) => combined.addTrack(t));
-        gotVideo = combined.getVideoTracks().length > 0;
-      } catch {
-        gotVideo = false;
+      if (!session.localMediaStream) {
+        session.localMediaStream = new MediaStream();
       }
 
-      try {
-        const aStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
-        aStream.getAudioTracks().forEach((t) => combined.addTrack(t));
-        gotAudio = combined.getAudioTracks().length > 0;
-      } catch {
-        gotAudio = false;
+      if (!session.getRawCameraTrack()) {
+        const vTrack = await acquireVideoTrack();
+        if (vTrack) {
+          vTrack.enabled = !session.isVideoOff;
+          session.localMediaStream.addTrack(vTrack);
+        }
       }
 
-      session.localMediaStream = combined;
+      if (!session.getRawAudioTrack()) {
+        const aTrack = await acquireAudioTrack();
+        if (aTrack) {
+          aTrack.enabled = !session.isMuted;
+          session.localMediaStream.addTrack(aTrack);
+        }
+      }
+
+      const gotAudio = Boolean(session.getRawAudioTrack());
+      const gotVideo = Boolean(session.getRawCameraTrack());
+
       session.isMuted = !gotAudio;
       session.isVideoOff = !gotVideo;
       setIsMuted(!gotAudio);
@@ -450,7 +573,7 @@ export function useLiveKitRoom({
     } finally {
       session.mediaInitPromise = null;
     }
-  }, [pushNotification, refreshDevices, sessionKey]);
+  }, [acquireAudioTrack, acquireVideoTrack, pushNotification, refreshDevices, sessionKey]);
 
   const trackMeshPresence = useCallback(async () => {
     const session = getSession(sessionKey);
@@ -472,6 +595,9 @@ export function useLiveKitRoom({
       for (const pc of Array.from(session.peerConnections.values())) {
         const transceiver = getTransceiverByRole(pc, role);
         if (transceiver?.sender) {
+          if (nextTrack) {
+            transceiver.direction = "sendrecv";
+          }
           await transceiver.sender.replaceTrack(nextTrack).catch(() => {});
         }
       }
@@ -491,7 +617,8 @@ export function useLiveKitRoom({
             session.room.localParticipant.unpublishTrack(camPub.track, false)
           ).catch(() => {});
         }
-        if (nextTrack && !session.isVideoOff) {
+        if (nextTrack && nextTrack.readyState === "live" && !session.isVideoOff) {
+          nextTrack.enabled = true;
           await session.room.localParticipant
             .publishTrack(nextTrack, { source: Track.Source.Camera })
             .catch(() => {});
@@ -537,14 +664,11 @@ export function useLiveKitRoom({
         }
 
         if (!rawCam) {
-          try {
-            const s = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
-            rawCam = s.getVideoTracks()[0] || null;
-            if (rawCam) {
-              if (!session.localMediaStream) session.localMediaStream = new MediaStream();
-              session.localMediaStream.addTrack(rawCam);
-            }
-          } catch {
+          rawCam = await acquireVideoTrack(selectedVideoId);
+          if (rawCam) {
+            if (!session.localMediaStream) session.localMediaStream = new MediaStream();
+            session.localMediaStream.addTrack(rawCam);
+          } else {
             pushNotification({
               title: "Kamera Tidak Aktif",
               message: "Nyalakan kamera terlebih dahulu untuk menggunakan efek background.",
@@ -572,8 +696,31 @@ export function useLiveKitRoom({
         setCamBusy(false);
       }
     },
-    [applyCameraTrackToTransport, pushNotification, sessionKey]
+    [acquireVideoTrack, applyCameraTrackToTransport, pushNotification, selectedVideoId, sessionKey]
   );
+
+  const callbacksRef = useRef({
+    ensureLocalMedia,
+    syncLiveKitTiles,
+    syncMeshTiles,
+    trackMeshPresence,
+    refreshDevices,
+    pushNotification,
+    unlockAudio,
+    acquireAudioTrack,
+    acquireVideoTrack
+  });
+  callbacksRef.current = {
+    ensureLocalMedia,
+    syncLiveKitTiles,
+    syncMeshTiles,
+    trackMeshPresence,
+    refreshDevices,
+    pushNotification,
+    unlockAudio,
+    acquireAudioTrack,
+    acquireVideoTrack
+  };
 
   // Langsung buka kamera & tampilkan preview lokal sejak awal tanpa menunggu connect/klik
   useEffect(() => {
@@ -582,12 +729,12 @@ export function useLiveKitRoom({
     const session = getSession(sessionKey);
 
     const openCameraImmediately = async () => {
-      await ensureLocalMedia();
+      await callbacksRef.current.ensureLocalMedia();
       if (unmounted) return;
       if (!session.room) {
-        syncMeshTiles();
+        callbacksRef.current.syncMeshTiles();
       } else {
-        syncLiveKitTiles();
+        callbacksRef.current.syncLiveKitTiles();
       }
     };
 
@@ -598,7 +745,17 @@ export function useLiveKitRoom({
       session.cleanupAll();
       sessions.delete(sessionKey);
     };
-  }, [ensureLocalMedia, meetingCode, sessionKey, syncLiveKitTiles, syncMeshTiles, userId]);
+  }, [meetingCode, sessionKey, userId]);
+
+  useEffect(() => {
+    const session = getSession(sessionKey);
+    if (session.room) {
+      syncLiveKitTiles();
+    } else if (session.localMediaStream) {
+      syncMeshTiles();
+      void trackMeshPresence();
+    }
+  }, [avatarUrl, isHost, sessionKey, syncLiveKitTiles, syncMeshTiles, trackMeshPresence, userName]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -621,11 +778,17 @@ export function useLiveKitRoom({
 
       if (audioT) {
         audioT.direction = "sendrecv";
-        if (audioTrack) await audioT.sender.replaceTrack(audioTrack).catch(() => {});
+        if (audioTrack) {
+          audioTrack.enabled = !session.isMuted;
+          await audioT.sender.replaceTrack(audioTrack).catch(() => {});
+        }
       }
       if (camT) {
         camT.direction = "sendrecv";
-        if (camTrack && !session.isVideoOff) await camT.sender.replaceTrack(camTrack).catch(() => {});
+        if (camTrack && !session.isVideoOff) {
+          camTrack.enabled = true;
+          await camT.sender.replaceTrack(camTrack).catch(() => {});
+        }
       }
       if (screenT) {
         screenT.direction = "sendrecv";
@@ -687,17 +850,21 @@ export function useLiveKitRoom({
           }
         }
 
-        track.onunmute = () => syncMeshTiles();
-        track.onmute = () => syncMeshTiles();
-        track.onended = () => syncMeshTiles();
-        syncMeshTiles();
+        track.onunmute = () => {
+          callbacksRef.current.syncMeshTiles();
+          callbacksRef.current.unlockAudio();
+        };
+        track.onmute = () => callbacksRef.current.syncMeshTiles();
+        track.onended = () => callbacksRef.current.syncMeshTiles();
+        callbacksRef.current.syncMeshTiles();
+        callbacksRef.current.unlockAudio();
       };
 
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           session.peerConnections.delete(peerId);
           session.remoteTracks.delete(peerId);
-          syncMeshTiles();
+          callbacksRef.current.syncMeshTiles();
         }
       };
 
@@ -709,9 +876,9 @@ export function useLiveKitRoom({
       setSfuNotice(reason);
       setConnectionState("mesh-connected");
 
-      await ensureLocalMedia();
+      await callbacksRef.current.ensureLocalMedia();
       if (cancelled) return;
-      syncMeshTiles();
+      callbacksRef.current.syncMeshTiles();
 
       const supabase = createClient();
       const channel = supabase.channel(`ramameet-mesh:${meetingCode}`, {
@@ -767,7 +934,7 @@ export function useLiveKitRoom({
             }
           }
 
-          syncMeshTiles();
+          callbacksRef.current.syncMeshTiles();
         })
         .on("broadcast", { event: "webrtc-signal" }, async ({ payload }) => {
           if (!payload || payload.to !== userId) return;
@@ -828,16 +995,16 @@ export function useLiveKitRoom({
         })
         .subscribe(async (status) => {
           if (status === "SUBSCRIBED" && !cancelled) {
-            await trackMeshPresence();
+            await callbacksRef.current.trackMeshPresence();
           }
         });
     };
 
     const connectLiveKit = async () => {
       // Pastikan kamera sudah terbuka dan tampil sebelum proses koneksi selesai
-      await ensureLocalMedia();
+      await callbacksRef.current.ensureLocalMedia();
       if (cancelled) return;
-      syncMeshTiles();
+      callbacksRef.current.syncMeshTiles();
 
       if (!token || !serverUrl) {
         await startMultiUserMeshFallback(
@@ -859,7 +1026,10 @@ export function useLiveKitRoom({
       });
       session.room = room;
 
-      const onUpdate = () => syncLiveKitTiles();
+      const onUpdate = () => {
+        callbacksRef.current.syncLiveKitTiles();
+        callbacksRef.current.unlockAudio();
+      };
 
       room
         .on(RoomEvent.ConnectionStateChanged, (state: ConnectionState) => {
@@ -879,14 +1049,14 @@ export function useLiveKitRoom({
         .on(RoomEvent.ActiveSpeakersChanged, onUpdate)
         .on(RoomEvent.ConnectionQualityChanged, onUpdate)
         .on(RoomEvent.Reconnecting, () => {
-          pushNotification({
+          callbacksRef.current.pushNotification({
             title: "Menghubungkan Ulang",
             message: "Koneksi WebRTC sedang dipulihkan secara otomatis...",
             type: "warning"
           });
         })
         .on(RoomEvent.Reconnected, () => {
-          pushNotification({
+          callbacksRef.current.pushNotification({
             title: "Terhubung Kembali",
             message: "Koneksi LiveKit SFU kembali stabil.",
             type: "success"
@@ -903,9 +1073,18 @@ export function useLiveKitRoom({
         }
         setSfuNotice(null);
 
+        // Aktifkan playback suara remote di LiveKit
+        void room.startAudio().catch(() => {});
+
         // Gunakan track kamera & mic yang sudah langsung terbuka sejak awal
-        const existingAudio = session.getRawAudioTrack();
-        const existingCam = session.getEffectiveCameraTrack();
+        let existingAudio = session.getRawAudioTrack();
+        if (!existingAudio && !session.isMuted) {
+          existingAudio = await callbacksRef.current.acquireAudioTrack();
+          if (existingAudio) {
+            if (!session.localMediaStream) session.localMediaStream = new MediaStream();
+            session.localMediaStream.addTrack(existingAudio);
+          }
+        }
 
         if (existingAudio && !session.isMuted) {
           existingAudio.enabled = true;
@@ -917,6 +1096,16 @@ export function useLiveKitRoom({
             session.isMuted = true;
             setIsMuted(true);
           });
+        }
+
+        let existingCam = session.getEffectiveCameraTrack();
+        if (!existingCam && !session.isVideoOff) {
+          const freshCam = await callbacksRef.current.acquireVideoTrack();
+          if (freshCam) {
+            if (!session.localMediaStream) session.localMediaStream = new MediaStream();
+            session.localMediaStream.addTrack(freshCam);
+            existingCam = session.getEffectiveCameraTrack();
+          }
         }
 
         if (existingCam && !session.isVideoOff) {
@@ -931,8 +1120,8 @@ export function useLiveKitRoom({
           });
         }
 
-        await refreshDevices();
-        syncLiveKitTiles();
+        await callbacksRef.current.refreshDevices();
+        callbacksRef.current.syncLiveKitTiles();
       } catch {
         room.disconnect();
         session.room = null;
@@ -948,20 +1137,7 @@ export function useLiveKitRoom({
       cancelled = true;
       session.cleanupTransport();
     };
-  }, [
-    enabled,
-    ensureLocalMedia,
-    meetingCode,
-    token,
-    serverUrl,
-    userId,
-    sessionKey,
-    pushNotification,
-    refreshDevices,
-    syncLiveKitTiles,
-    syncMeshTiles,
-    trackMeshPresence
-  ]);
+  }, [enabled, meetingCode, token, serverUrl, userId, sessionKey]);
 
   // Toggle Microphone (bebas race-condition & auto-recover jika track ended)
   const toggleMute = useCallback(async () => {
@@ -969,22 +1145,80 @@ export function useLiveKitRoom({
     if (session.micLock) return;
     session.micLock = true;
     setMicBusy(true);
+    unlockAudio();
 
     try {
       const nextMuted = !session.isMuted;
 
       if (session.room) {
-        try {
-          await session.room.localParticipant.setMicrophoneEnabled(!nextMuted);
-          session.isMuted = nextMuted;
-          setIsMuted(nextMuted);
-        } catch {
-          pushNotification({
-            title: "Mikrofon Gagal Diaktifkan",
-            message: "Periksa izin mikrofon di browser atau perangkat audio Anda.",
-            type: "error"
-          });
+        if (nextMuted) {
+          session.isMuted = true;
+          setIsMuted(true);
+
+          const rawAudio = session.getRawAudioTrack();
+          if (rawAudio) rawAudio.enabled = false;
+
+          const micPub = session.room.localParticipant.getTrackPublication(Track.Source.Microphone);
+          if (micPub?.track) {
+            micPub.track.mediaStreamTrack.enabled = false;
+            await micPub.track.mute().catch(() => {});
+          } else {
+            await session.room.localParticipant.setMicrophoneEnabled(false).catch(() => {});
+          }
+          syncLiveKitTiles();
+          return;
         }
+
+        // Unmute kembali dengan aman (aktifkan track live atau buat track baru jika sudah ended)
+        const micPub = session.room.localParticipant.getTrackPublication(Track.Source.Microphone);
+        const pubTrack = micPub?.track?.mediaStreamTrack || null;
+
+        if (micPub?.track && pubTrack && pubTrack.readyState === "live") {
+          pubTrack.enabled = true;
+          await micPub.track.unmute().catch(() => {});
+          const rawAudio = session.getRawAudioTrack();
+          if (rawAudio) rawAudio.enabled = true;
+        } else {
+          if (micPub?.track) {
+            await Promise.resolve(
+              session.room.localParticipant.unpublishTrack(micPub.track, true)
+            ).catch(() => {});
+          }
+
+          let audioTrack = session.getRawAudioTrack();
+          if (!audioTrack) {
+            audioTrack = await acquireAudioTrack(selectedAudioId);
+          }
+
+          if (!audioTrack) {
+            pushNotification({
+              title: "Mikrofon Gagal Diaktifkan",
+              message: "Periksa izin mikrofon di browser atau perangkat audio Anda.",
+              type: "error"
+            });
+            return;
+          }
+
+          audioTrack.enabled = true;
+          if (!session.localMediaStream) session.localMediaStream = new MediaStream();
+          session.localMediaStream.getAudioTracks().forEach((t) => {
+            if (t !== audioTrack) {
+              t.stop();
+              session.localMediaStream?.removeTrack(t);
+            }
+          });
+          if (!session.localMediaStream.getAudioTracks().includes(audioTrack)) {
+            session.localMediaStream.addTrack(audioTrack);
+          }
+
+          await session.room.localParticipant
+            .publishTrack(audioTrack, { source: Track.Source.Microphone })
+            .catch(() => session.room?.localParticipant.setMicrophoneEnabled(true).catch(() => {}));
+          await refreshDevices();
+        }
+
+        session.isMuted = false;
+        setIsMuted(false);
         syncLiveKitTiles();
         return;
       }
@@ -992,24 +1226,8 @@ export function useLiveKitRoom({
       let audioTrack = session.getRawAudioTrack();
 
       if (!nextMuted && !audioTrack) {
-        try {
-          const s = await navigator.mediaDevices.getUserMedia({
-            audio: selectedAudioId
-              ? { ...AUDIO_CONSTRAINTS, deviceId: { exact: selectedAudioId } }
-              : AUDIO_CONSTRAINTS
-          });
-          audioTrack = s.getAudioTracks()[0] || null;
-          if (audioTrack) {
-            if (!session.localMediaStream) session.localMediaStream = new MediaStream();
-            session.localMediaStream.getAudioTracks().forEach((t) => {
-              t.stop();
-              session.localMediaStream?.removeTrack(t);
-            });
-            session.localMediaStream.addTrack(audioTrack);
-            await replaceMeshRoleTrack("audio", audioTrack);
-            await refreshDevices();
-          }
-        } catch {
+        audioTrack = await acquireAudioTrack(selectedAudioId);
+        if (!audioTrack) {
           pushNotification({
             title: "Izin Mikrofon Ditolak",
             message: "Aktifkan izin mikrofon di pengaturan browser untuk berbicara.",
@@ -1017,10 +1235,20 @@ export function useLiveKitRoom({
           });
           return;
         }
+        if (!session.localMediaStream) session.localMediaStream = new MediaStream();
+        session.localMediaStream.getAudioTracks().forEach((t) => {
+          t.stop();
+          session.localMediaStream?.removeTrack(t);
+        });
+        session.localMediaStream.addTrack(audioTrack);
+        await refreshDevices();
       }
 
       if (audioTrack) {
         audioTrack.enabled = !nextMuted;
+        if (!nextMuted) {
+          await replaceMeshRoleTrack("audio", audioTrack);
+        }
       }
       session.isMuted = nextMuted;
       setIsMuted(nextMuted);
@@ -1031,6 +1259,7 @@ export function useLiveKitRoom({
       setMicBusy(false);
     }
   }, [
+    acquireAudioTrack,
     pushNotification,
     refreshDevices,
     replaceMeshRoleTrack,
@@ -1038,7 +1267,8 @@ export function useLiveKitRoom({
     sessionKey,
     syncLiveKitTiles,
     syncMeshTiles,
-    trackMeshPresence
+    trackMeshPresence,
+    unlockAudio
   ]);
 
   const forceMute = useCallback(async () => {
@@ -1046,14 +1276,21 @@ export function useLiveKitRoom({
     session.isMuted = true;
     setIsMuted(true);
 
+    const audioTrack = session.getRawAudioTrack();
+    if (audioTrack) audioTrack.enabled = false;
+
     if (session.room) {
-      await session.room.localParticipant.setMicrophoneEnabled(false).catch(() => {});
+      const micPub = session.room.localParticipant.getTrackPublication(Track.Source.Microphone);
+      if (micPub?.track) {
+        micPub.track.mediaStreamTrack.enabled = false;
+        await micPub.track.mute().catch(() => {});
+      } else {
+        await session.room.localParticipant.setMicrophoneEnabled(false).catch(() => {});
+      }
       syncLiveKitTiles();
       return;
     }
 
-    const audioTrack = session.getRawAudioTrack();
-    if (audioTrack) audioTrack.enabled = false;
     syncMeshTiles();
     await trackMeshPresence();
   }, [sessionKey, syncLiveKitTiles, syncMeshTiles, trackMeshPresence]);
@@ -1064,81 +1301,97 @@ export function useLiveKitRoom({
     if (session.camLock) return;
     session.camLock = true;
     setCamBusy(true);
+    unlockAudio();
 
     try {
       const nextVideoOff = !session.isVideoOff;
 
-      if (session.room && !session.effectProcessor) {
-        try {
-          await session.room.localParticipant.setCameraEnabled(!nextVideoOff);
-          session.isVideoOff = nextVideoOff;
-          setIsVideoOff(nextVideoOff);
-        } catch {
-          pushNotification({
-            title: "Kamera Gagal Diaktifkan",
-            message: "Pastikan kamera tidak sedang dipakai aplikasi lain dan izin browser aktif.",
-            type: "error"
+      if (nextVideoOff) {
+        session.isVideoOff = true;
+        setIsVideoOff(true);
+        session.destroyEffectProcessor();
+
+        if (session.room) {
+          const camPub = session.room.localParticipant.getTrackPublication(Track.Source.Camera);
+          if (camPub?.track) {
+            await Promise.resolve(
+              session.room.localParticipant.unpublishTrack(camPub.track, true)
+            ).catch(() => {});
+          }
+        } else {
+          await replaceMeshRoleTrack("camera", null);
+        }
+
+        if (session.localMediaStream) {
+          session.localMediaStream.getVideoTracks().forEach((t) => {
+            t.stop();
+            session.localMediaStream?.removeTrack(t);
           });
         }
-        syncLiveKitTiles();
+
+        if (session.room) {
+          syncLiveKitTiles();
+        } else {
+          syncMeshTiles();
+          await trackMeshPresence();
+        }
         return;
       }
 
+      // Nyalakan kembali kamera (ON)
       let rawCam = session.getRawCameraTrack();
 
-      if (!nextVideoOff && !rawCam) {
-        try {
-          const s = await navigator.mediaDevices.getUserMedia({
-            video: selectedVideoId
-              ? { ...VIDEO_CONSTRAINTS, deviceId: { exact: selectedVideoId } }
-              : VIDEO_CONSTRAINTS
-          });
-          rawCam = s.getVideoTracks()[0] || null;
-          if (rawCam) {
-            if (!session.localMediaStream) session.localMediaStream = new MediaStream();
-            session.localMediaStream.getVideoTracks().forEach((t) => {
-              t.stop();
-              session.localMediaStream?.removeTrack(t);
-            });
-            session.localMediaStream.addTrack(rawCam);
-            await refreshDevices();
-
-            if (session.cameraEffect !== "none") {
-              session.destroyEffectProcessor();
-              session.effectProcessor = new VideoEffectProcessor(rawCam, session.cameraEffect);
-            }
-          }
-        } catch {
+      if (!rawCam) {
+        rawCam = await acquireVideoTrack(selectedVideoId);
+        if (!rawCam) {
           pushNotification({
-            title: "Izin Kamera Ditolak",
-            message: "Aktifkan izin kamera di browser untuk menyalakan video.",
+            title: "Kamera Gagal Diaktifkan",
+            message: "Pastikan kamera tidak sedang dipakai aplikasi lain dan izin browser aktif.",
             type: "warning"
           });
           return;
         }
+        if (!session.localMediaStream) session.localMediaStream = new MediaStream();
+        session.localMediaStream.getVideoTracks().forEach((t) => {
+          t.stop();
+          session.localMediaStream?.removeTrack(t);
+        });
+        session.localMediaStream.addTrack(rawCam);
+        await refreshDevices();
       }
 
-      session.isVideoOff = nextVideoOff;
-      setIsVideoOff(nextVideoOff);
+      rawCam.enabled = true;
 
-      if (rawCam) rawCam.enabled = !nextVideoOff;
-      if (session.effectProcessor) session.effectProcessor.setPaused(nextVideoOff);
+      if (session.cameraEffect !== "none") {
+        session.destroyEffectProcessor();
+        session.effectProcessor = new VideoEffectProcessor(rawCam, session.cameraEffect);
+        session.effectProcessor.setPaused(false);
+      }
+
+      session.isVideoOff = false;
+      setIsVideoOff(false);
 
       const effectiveTrack = session.getEffectiveCameraTrack();
-      await applyCameraTrackToTransport(nextVideoOff ? null : effectiveTrack);
-      await trackMeshPresence();
+      await applyCameraTrackToTransport(effectiveTrack);
+      if (!session.room) {
+        await trackMeshPresence();
+      }
     } finally {
       session.camLock = false;
       setCamBusy(false);
     }
   }, [
+    acquireVideoTrack,
     applyCameraTrackToTransport,
     pushNotification,
     refreshDevices,
+    replaceMeshRoleTrack,
     selectedVideoId,
     sessionKey,
     syncLiveKitTiles,
-    trackMeshPresence
+    syncMeshTiles,
+    trackMeshPresence,
+    unlockAudio
   ]);
 
   const stopLocalScreenStream = useCallback(async () => {
@@ -1195,6 +1448,7 @@ export function useLiveKitRoom({
   const toggleScreenShare = useCallback(async () => {
     const session = getSession(sessionKey);
     if (session.screenLock) return;
+    unlockAudio();
 
     session.screenLock = true;
     try {
@@ -1376,82 +1630,83 @@ export function useLiveKitRoom({
     stopLocalScreenStream,
     syncLiveKitTiles,
     syncMeshTiles,
-    trackMeshPresence
+    trackMeshPresence,
+    unlockAudio
   ]);
 
   const switchAudioDevice = useCallback(
     async (deviceId: string) => {
       const session = getSession(sessionKey);
       setSelectedAudioId(deviceId);
+      const newTrack = await acquireAudioTrack(deviceId);
+      if (!newTrack) {
+        pushNotification({
+          title: "Gagal Ganti Mikrofon",
+          message: "Perangkat audio yang dipilih tidak dapat diakses.",
+          type: "error"
+        });
+        return;
+      }
+
+      newTrack.enabled = !session.isMuted;
+      if (!session.localMediaStream) session.localMediaStream = new MediaStream();
+      session.localMediaStream.getAudioTracks().forEach((t) => {
+        t.stop();
+        session.localMediaStream?.removeTrack(t);
+      });
+      session.localMediaStream.addTrack(newTrack);
+
       if (session.room) {
-        await session.room.switchActiveDevice("audioinput", deviceId).catch(() => {});
-      } else {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: { ...AUDIO_CONSTRAINTS, deviceId: { exact: deviceId } }
-          });
-          const newTrack = stream.getAudioTracks()[0];
-          if (newTrack) {
-            newTrack.enabled = !session.isMuted;
-            if (!session.localMediaStream) session.localMediaStream = new MediaStream();
-            session.localMediaStream.getAudioTracks().forEach((t) => {
-              t.stop();
-              session.localMediaStream?.removeTrack(t);
-            });
-            session.localMediaStream.addTrack(newTrack);
-            await replaceMeshRoleTrack("audio", newTrack);
-            syncMeshTiles();
-          }
-        } catch {
-          pushNotification({
-            title: "Gagal Ganti Mikrofon",
-            message: "Perangkat audio yang dipilih tidak dapat diakses.",
-            type: "error"
-          });
+        const micPub = session.room.localParticipant.getTrackPublication(Track.Source.Microphone);
+        if (micPub?.track) {
+          await Promise.resolve(
+            session.room.localParticipant.unpublishTrack(micPub.track, true)
+          ).catch(() => {});
         }
+        if (!session.isMuted) {
+          await session.room.localParticipant
+            .publishTrack(newTrack, { source: Track.Source.Microphone })
+            .catch(() => {});
+        }
+        syncLiveKitTiles();
+      } else {
+        await replaceMeshRoleTrack("audio", newTrack);
+        syncMeshTiles();
       }
     },
-    [pushNotification, replaceMeshRoleTrack, sessionKey, syncMeshTiles]
+    [acquireAudioTrack, pushNotification, replaceMeshRoleTrack, sessionKey, syncLiveKitTiles, syncMeshTiles]
   );
 
   const switchVideoDevice = useCallback(
     async (deviceId: string) => {
       const session = getSession(sessionKey);
       setSelectedVideoId(deviceId);
-      if (session.room && !session.effectProcessor) {
-        await session.room.switchActiveDevice("videoinput", deviceId).catch(() => {});
-      } else {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: { ...VIDEO_CONSTRAINTS, deviceId: { exact: deviceId } }
-          });
-          const newTrack = stream.getVideoTracks()[0];
-          if (newTrack) {
-            newTrack.enabled = !session.isVideoOff;
-            if (!session.localMediaStream) session.localMediaStream = new MediaStream();
-            session.localMediaStream.getVideoTracks().forEach((t) => {
-              t.stop();
-              session.localMediaStream?.removeTrack(t);
-            });
-            session.localMediaStream.addTrack(newTrack);
-
-            if (session.cameraEffect !== "none") {
-              session.destroyEffectProcessor();
-              session.effectProcessor = new VideoEffectProcessor(newTrack, session.cameraEffect);
-              session.effectProcessor.setPaused(session.isVideoOff);
-            }
-            await applyCameraTrackToTransport(session.getEffectiveCameraTrack());
-          }
-        } catch {
-          pushNotification({
-            title: "Gagal Ganti Kamera",
-            message: "Perangkat kamera yang dipilih tidak dapat diakses.",
-            type: "error"
-          });
-        }
+      const newTrack = await acquireVideoTrack(deviceId);
+      if (!newTrack) {
+        pushNotification({
+          title: "Gagal Ganti Kamera",
+          message: "Perangkat kamera yang dipilih tidak dapat diakses.",
+          type: "error"
+        });
+        return;
       }
+
+      newTrack.enabled = !session.isVideoOff;
+      if (!session.localMediaStream) session.localMediaStream = new MediaStream();
+      session.localMediaStream.getVideoTracks().forEach((t) => {
+        t.stop();
+        session.localMediaStream?.removeTrack(t);
+      });
+      session.localMediaStream.addTrack(newTrack);
+
+      if (session.cameraEffect !== "none") {
+        session.destroyEffectProcessor();
+        session.effectProcessor = new VideoEffectProcessor(newTrack, session.cameraEffect);
+        session.effectProcessor.setPaused(session.isVideoOff);
+      }
+      await applyCameraTrackToTransport(session.getEffectiveCameraTrack());
     },
-    [applyCameraTrackToTransport, pushNotification, sessionKey]
+    [acquireVideoTrack, applyCameraTrackToTransport, pushNotification, sessionKey]
   );
 
   const disconnect = useCallback(() => {
