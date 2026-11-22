@@ -3,8 +3,15 @@ kind: Deployment
 metadata:
   name: ramameet-signaling
   namespace: default
+  labels:
+    app: ramameet-signaling
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: ramameet-signaling
@@ -13,36 +20,22 @@ spec:
       labels:
         app: ramameet-signaling
     spec:
+      imagePullSecrets:
+        - name: ghcr-secret
       containers:
         - name: signaling
           image: ghcr.io/ramaaloysius54-wq/meet:latest
-          command: ["node", "signaling/dist/index.js"]
+          imagePullPolicy: Always
+          command: ["node", "/app/signaling/dist/index.js"]
           ports:
             - containerPort: 4000
           envFrom:
             - configMapRef:
                 name: ramameet-config
+                optional: true
             - secretRef:
                 name: ramameet-secrets
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 4000
-            initialDelaySeconds: 10
-            periodSeconds: 15
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 4000
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
+                optional: true
 ---
 apiVersion: v1
 kind: Service
@@ -53,5 +46,7 @@ spec:
   selector:
     app: ramameet-signaling
   ports:
-    - port: 4000
+    - protocol: TCP
+      port: 4000
       targetPort: 4000
+  type: ClusterIP
