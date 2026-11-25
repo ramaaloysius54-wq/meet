@@ -20,11 +20,12 @@ spec:
       labels:
         app: ramameet-web
     spec:
+      automountServiceAccountToken: false
       imagePullSecrets:
-        - name: ghcr-secret
+        - name: dockerhub-secret
       containers:
         - name: web
-          image: ghcr.io/ramaaloysius54-wq/meet:latest
+          image: USERNAME_DOCKERHUB/ramameet:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000
@@ -37,16 +38,18 @@ spec:
                 optional: true
           readinessProbe:
             httpGet:
-              path: /login
+              path: /api/health
               port: 3000
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
-              path: /login
+              path: /api/health
               port: 3000
             initialDelaySeconds: 20
             periodSeconds: 20
+            timeoutSeconds: 5
 ---
 apiVersion: v1
 kind: Service

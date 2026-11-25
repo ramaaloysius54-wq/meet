@@ -146,6 +146,15 @@ function blockedResponse(status: 400 | 403 | 404 | 405 | 429, message: string): 
   return applySecurityHeaders(res);
 }
 
+function clearStaleSupabaseCookies(request: NextRequest, target: NextResponse) {
+  request.cookies
+    .getAll()
+    .filter((c) => c.name.startsWith("sb-"))
+    .forEach((c) => {
+      target.cookies.delete(c.name);
+    });
+}
+
 function runSecurityWaf(request: NextRequest): NextResponse | null {
   const ip = getClientIp(request);
   const method = request.method.toUpperCase();
@@ -218,7 +227,8 @@ function runSecurityWaf(request: NextRequest): NextResponse | null {
   // 8. Anti-CSRF untuk API mutasi (validasi Origin vs Host)
   if (isApi && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
     const origin = request.headers.get("origin");
-    const host = request.headers.get("x-forwarded-host") || request.headers.get("host");
+    const rawHost = request.headers.get("x-forwarded-host") || request.headers.get("host");
+    const host = rawHost ? rawHost.split(",")[0].trim() : null;
     if (origin && host) {
       try {
         if (new URL(origin).host !== host) {
@@ -235,6 +245,13 @@ function runSecurityWaf(request: NextRequest): NextResponse | null {
 
 // --- 2. MIDDLEWARE UTAMA ---
 export async function middleware(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+
+  // Bypass cepat untuk Kubernetes Readiness/Liveness Probe
+  if (pathname === "/api/health") {
+    return NextResponse.json({ status: "ok" }, { status: 200 });
+  }
+
   const securityBlock = runSecurityWaf(request);
   if (securityBlock) return securityBlock;
 
@@ -249,26 +266,47 @@ export async function middleware(request: NextRequest) {
     return applySecurityHeaders(response);
   }
 
-  const supabase = createServerClient(supabaseUrl, supabaseKey, {
-    cookies: {
-      getAll() {
-        return request.cookies.getAll();
-      },
-      setAll(cookiesToSet: { name: string; value: string; options?: any }[]) {
-        cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
-        response = NextResponse.next({ request });
-        cookiesToSet.forEach(({ name, value, options }) =>
-          response.cookies.set(name, value, options)
-        );
+  const hasSupabaseCookie = request.cookies
+    .getAll()
+    .some((c) => c.name.startsWith("sb-"));
+
+  let user = null;
+  let shouldClearStaleCookies = false;
+
+  if (hasSupabaseCookie) {
+    const supabase = createServerClient(supabaseUrl, supabaseKey, {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll();
+        },
+        setAll(cookiesToSet: { name: string; value: string; options?: any }[]) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
+          response = NextResponse.next({ request });
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, options)
+          );
+        }
       }
+    });
+
+    try {
+      const { data, error } = await supabase.auth.getUser();
+      if (error) {
+        if (
+          error.code === "refresh_token_not_found" ||
+          error.code === "invalid_refresh_token" ||
+          error.status === 400
+        ) {
+          shouldClearStaleCookies = true;
+        }
+      } else {
+        user = data.user;
+      }
+    } catch {
+      shouldClearStaleCookies = true;
     }
-  });
+  }
 
-  const {
-    data: { user }
-  } = await supabase.auth.getUser();
-
-  const pathname = request.nextUrl.pathname;
   const isPublicAuthPage = pathname.startsWith("/login") || pathname.startsWith("/register");
   const isAuthCallback = pathname.startsWith("/auth");
   const isApiRoute = pathname.startsWith("/api");
@@ -278,11 +316,19 @@ export async function middleware(request: NextRequest) {
     const safeRedirect =
       pathname.startsWith("/") && !pathname.startsWith("//") ? pathname : "/";
     loginUrl.searchParams.set("redirect", safeRedirect);
-    return applySecurityHeaders(NextResponse.redirect(loginUrl));
+    const redirectRes = NextResponse.redirect(loginUrl);
+    if (shouldClearStaleCookies) {
+      clearStaleSupabaseCookies(request, redirectRes);
+    }
+    return applySecurityHeaders(redirectRes);
   }
 
   if (user && isPublicAuthPage) {
     return applySecurityHeaders(NextResponse.redirect(new URL("/", request.url)));
+  }
+
+  if (shouldClearStaleCookies) {
+    clearStaleSupabaseCookies(request, response);
   }
 
   return applySecurityHeaders(response);
