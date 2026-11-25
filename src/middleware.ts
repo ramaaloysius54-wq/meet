@@ -1,9 +1,38 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-// --- 1. KONFIGURASI KEAMANAN ---
+// --- 1. KONFIGURASI KEAMANAN & ANTI-IDOR ---
 const LEGACY_BLOCKED_ROUTES = /^\/(api\/)?(contacts|upgrade|billing)(\/|$)/i;
 const ALLOWED_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]);
+const SAFE_HOST_PATTERN = /^[a-zA-Z0-9.-]+(:\d{1,5})?$/;
+
+// Header identitas yang tidak boleh dipalsukan dari client (Anti Header-Spoofing IDOR)
+const SPOOFABLE_IDENTITY_HEADERS = [
+  "x-user-id",
+  "x-verified-user-id",
+  "x-verified-user-email",
+  "x-forwarded-user",
+  "x-auth-user",
+  "x-tenant-id",
+  "x-company-id",
+  "x-organization-id",
+  "x-role",
+  "x-is-admin"
+];
+
+// Parameter query identitas yang wajib cocok dengan user login (Anti Query-Tampering & HPP IDOR)
+const IDOR_IDENTITY_QUERY_PARAMS = new Set([
+  "user_id",
+  "userid",
+  "host_id",
+  "hostid",
+  "owner_id",
+  "ownerid",
+  "account_id",
+  "accountid",
+  "profile_id",
+  "profileid"
+]);
 
 // Blokir akses ke .env, .git, file konfigurasi, backup, dan target scan umum
 const BLOCKED_PATH_PATTERNS: RegExp[] = [
@@ -45,12 +74,25 @@ const MAX_STRIKES_BEFORE_BAN = 3;
 const rateStore = new Map<string, { count: number; resetAt: number }>();
 const strikeStore = new Map<string, { strikes: number; resetAt: number; bannedUntil: number }>();
 
+type PendingCookie = {
+  name: string;
+  value: string;
+  options?: any;
+};
+
 function getClientIp(req: NextRequest): string {
   const cfIp = req.headers.get("cf-connecting-ip");
   if (cfIp) return cfIp.trim();
   const forwarded = req.headers.get("x-forwarded-for");
   if (forwarded) return forwarded.split(",")[0].trim();
   return req.headers.get("x-real-ip") || "unknown";
+}
+
+function getSafeHost(req: NextRequest): string | null {
+  const rawHost = req.headers.get("x-forwarded-host") || req.headers.get("host");
+  if (!rawHost) return null;
+  const host = rawHost.split(",")[0].trim();
+  return SAFE_HOST_PATTERN.test(host) ? host : null;
 }
 
 function safeDecode(input: string): string | null {
@@ -135,11 +177,21 @@ function applySecurityHeaders(res: NextResponse): NextResponse {
   return res;
 }
 
-function blockedResponse(status: 400 | 403 | 404 | 405 | 429, message: string): NextResponse {
-  const res = new NextResponse(message, {
-    status,
-    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
-  });
+function blockedResponse(
+  status: 400 | 401 | 403 | 404 | 405 | 429,
+  message: string,
+  asJson = false
+): NextResponse {
+  const res = asJson
+    ? NextResponse.json(
+        { error: message },
+        { status, headers: { "Cache-Control": "no-store, private" } }
+      )
+    : new NextResponse(message, {
+        status,
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
+      });
+
   if (status === 429) {
     res.headers.set("Retry-After", "60");
   }
@@ -155,27 +207,76 @@ function clearStaleSupabaseCookies(request: NextRequest, target: NextResponse) {
     });
 }
 
+function buildForwardHeaders(
+  request: NextRequest,
+  verifiedUser?: { id: string; email?: string | null } | null
+): Headers {
+  const headers = new Headers(request.headers);
+  for (const h of SPOOFABLE_IDENTITY_HEADERS) {
+    headers.delete(h);
+  }
+  if (verifiedUser?.id) {
+    headers.set("x-verified-user-id", verifiedUser.id);
+    if (verifiedUser.email) {
+      headers.set("x-verified-user-email", verifiedUser.email);
+    }
+  }
+  return headers;
+}
+
+function buildRedirectUrl(request: NextRequest, targetPath: string): URL {
+  const host = getSafeHost(request);
+  if (!host) return new URL(targetPath, request.url);
+
+  const rawProto = request.headers.get("x-forwarded-proto");
+  const candidateProto = rawProto
+    ? rawProto.split(",")[0].trim().toLowerCase()
+    : request.nextUrl.protocol.replace(":", "").toLowerCase();
+  const proto = candidateProto === "http" || candidateProto === "https" ? candidateProto : "https";
+
+  return new URL(targetPath, `${proto}://${host}`);
+}
+
+function hasIdorQueryTampering(request: NextRequest, authenticatedUserId: string): boolean {
+  const seenIdentityParams = new Set<string>();
+  for (const [rawKey, rawValue] of Array.from(request.nextUrl.searchParams.entries())) {
+    const key = rawKey.toLowerCase();
+    if (!IDOR_IDENTITY_QUERY_PARAMS.has(key)) continue;
+
+    // Tolak HTTP Parameter Pollution (duplikasi parameter identitas)
+    if (seenIdentityParams.has(key)) return true;
+    seenIdentityParams.add(key);
+
+    // Tolak jika nilai identitas tidak sama persis dengan user yang sedang login
+    if (rawValue.trim() !== authenticatedUserId) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function runSecurityWaf(request: NextRequest): NextResponse | null {
   const ip = getClientIp(request);
   const method = request.method.toUpperCase();
   const userAgent = request.headers.get("user-agent") || "";
   const rawPathname = request.nextUrl.pathname;
   const rawSearch = request.nextUrl.search || "";
+  const isApiRaw = rawPathname.startsWith("/api/");
 
   // 1. Tolak IP yang sedang di-ban karena aktivitas scanning/attack
   if (isIpBanned(ip)) {
-    return blockedResponse(403, "Forbidden");
+    return blockedResponse(403, "Forbidden", isApiRaw);
   }
 
   // 2. Tolak metode HTTP yang tidak diperlukan (TRACE, TRACK, CONNECT, dll.)
   if (!ALLOWED_METHODS.has(method)) {
-    return blockedResponse(405, "Method Not Allowed");
+    return blockedResponse(405, "Method Not Allowed", isApiRaw);
   }
 
   // 3. Blokir User-Agent scanner otomatis (sqlmap, nikto, dirsearch, nuclei, dll.)
   if (userAgent && SCANNER_UA_PATTERN.test(userAgent)) {
     recordStrike(ip);
-    return blockedResponse(403, "Forbidden");
+    return blockedResponse(403, "Forbidden", isApiRaw);
   }
 
   // 4. Decode URL & cek Path Traversal / malform encoding
@@ -183,18 +284,20 @@ function runSecurityWaf(request: NextRequest): NextResponse | null {
   const decodedSearch = safeDecode(rawSearch);
   if (decodedPath === null || decodedSearch === null) {
     recordStrike(ip);
-    return blockedResponse(400, "Bad Request");
+    return blockedResponse(400, "Bad Request", isApiRaw);
   }
+
+  const isApi = decodedPath.startsWith("/api/");
 
   // 4b. Tutup rute lama Contacts/Upgrade/Billing agar tidak bisa diakses langsung
   if (LEGACY_BLOCKED_ROUTES.test(decodedPath)) {
-    return blockedResponse(404, "Not Found");
+    return blockedResponse(404, "Not Found", isApi);
   }
 
   // 5. Blokir akses .env, .git, backup file, dan path probing
   if (BLOCKED_PATH_PATTERNS.some((p) => p.test(decodedPath))) {
     recordStrike(ip);
-    return blockedResponse(404, "Not Found");
+    return blockedResponse(404, "Not Found", isApi);
   }
 
   // 6. Anti-SQL Injection & Anti-XSS/LFI pada path dan query string
@@ -204,38 +307,51 @@ function runSecurityWaf(request: NextRequest): NextResponse | null {
     INJECTION_PATTERNS.some((p) => p.test(combinedTarget))
   ) {
     recordStrike(ip);
-    return blockedResponse(403, "Forbidden");
+    return blockedResponse(403, "Forbidden", isApi);
   }
 
   // 7. Rate Limiting bertingkat (Anti Brute-Force & Anti Burp Intruder)
-  const isApi = decodedPath.startsWith("/api/");
   const isAuth =
     decodedPath.startsWith("/login") ||
     decodedPath.startsWith("/register") ||
     decodedPath.startsWith("/auth");
 
   if (isAuth && isRateLimited(ip, "auth", 25)) {
-    return blockedResponse(429, "Too Many Requests");
+    return blockedResponse(429, "Too Many Requests", isApi);
   }
   if (isApi && isRateLimited(ip, "api", 60)) {
-    return blockedResponse(429, "Too Many Requests");
+    return blockedResponse(429, "Too Many Requests", true);
   }
   if (!isApi && !isAuth && isRateLimited(ip, "web", 120)) {
-    return blockedResponse(429, "Too Many Requests");
+    return blockedResponse(429, "Too Many Requests", false);
   }
 
-  // 8. Anti-CSRF untuk API mutasi (validasi Origin vs Host)
+  // 8. Anti-CSRF ketat untuk API mutasi (validasi Sec-Fetch-Site, Origin, & Referer)
   if (isApi && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    const secFetchSite = request.headers.get("sec-fetch-site");
+    if (secFetchSite && secFetchSite.toLowerCase() === "cross-site") {
+      return blockedResponse(403, "Forbidden: Cross-site request blocked", true);
+    }
+
+    const host = getSafeHost(request);
     const origin = request.headers.get("origin");
-    const rawHost = request.headers.get("x-forwarded-host") || request.headers.get("host");
-    const host = rawHost ? rawHost.split(",")[0].trim() : null;
-    if (origin && host) {
+    const referer = request.headers.get("referer");
+
+    if (host && origin) {
       try {
         if (new URL(origin).host !== host) {
-          return blockedResponse(403, "Forbidden: Invalid Origin");
+          return blockedResponse(403, "Forbidden: Invalid Origin", true);
         }
       } catch {
-        return blockedResponse(403, "Forbidden: Invalid Origin");
+        return blockedResponse(403, "Forbidden: Invalid Origin", true);
+      }
+    } else if (host && referer) {
+      try {
+        if (new URL(referer).host !== host) {
+          return blockedResponse(403, "Forbidden: Invalid Referer", true);
+        }
+      } catch {
+        return blockedResponse(403, "Forbidden: Invalid Referer", true);
       }
     }
   }
@@ -245,10 +361,18 @@ function runSecurityWaf(request: NextRequest): NextResponse | null {
 
 // --- 2. MIDDLEWARE UTAMA ---
 export async function middleware(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+
+  // Bypass cepat untuk Kubernetes Readiness/Liveness Probe
+  if (pathname === "/api/health") {
+    return NextResponse.json(
+      { status: "ok" },
+      { status: 200, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+
   const securityBlock = runSecurityWaf(request);
   if (securityBlock) return securityBlock;
-
-  let response = NextResponse.next({ request });
 
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseKey =
@@ -256,15 +380,19 @@ export async function middleware(request: NextRequest) {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   if (!supabaseUrl || !supabaseKey) {
-    return applySecurityHeaders(response);
+    const fallbackRes = NextResponse.next({
+      request: { headers: buildForwardHeaders(request, null) }
+    });
+    return applySecurityHeaders(fallbackRes);
   }
 
   const hasSupabaseCookie = request.cookies
     .getAll()
     .some((c) => c.name.startsWith("sb-"));
 
-  let user = null;
+  let user: { id: string; email?: string | null } | null = null;
   let shouldClearStaleCookies = false;
+  let pendingCookies: PendingCookie[] = [];
 
   if (hasSupabaseCookie) {
     const supabase = createServerClient(supabaseUrl, supabaseKey, {
@@ -272,12 +400,9 @@ export async function middleware(request: NextRequest) {
         getAll() {
           return request.cookies.getAll();
         },
-        setAll(cookiesToSet: { name: string; value: string; options?: any }[]) {
+        setAll(cookiesToSet: PendingCookie[]) {
           cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
-          response = NextResponse.next({ request });
-          cookiesToSet.forEach(({ name, value, options }) =>
-            response.cookies.set(name, value, options)
-          );
+          pendingCookies = cookiesToSet;
         }
       }
     });
@@ -292,24 +417,43 @@ export async function middleware(request: NextRequest) {
         ) {
           shouldClearStaleCookies = true;
         }
-      } else {
-        user = data.user;
+      } else if (data.user) {
+        user = { id: data.user.id, email: data.user.email };
       }
     } catch {
       shouldClearStaleCookies = true;
     }
   }
 
-  const pathname = request.nextUrl.pathname;
   const isPublicAuthPage = pathname.startsWith("/login") || pathname.startsWith("/register");
   const isAuthCallback = pathname.startsWith("/auth");
   const isApiRoute = pathname.startsWith("/api");
+  const isPublicApiRoute = pathname === "/api/health" || pathname.startsWith("/api/auth/");
 
+  // Anti-IDOR Layer 1: Blokir akses API terproteksi jika tidak terautentikasi
+  if (isApiRoute && !isPublicApiRoute && !user) {
+    const unauthRes = blockedResponse(401, "Unauthorized", true);
+    if (shouldClearStaleCookies) {
+      clearStaleSupabaseCookies(request, unauthRes);
+    }
+    return unauthRes;
+  }
+
+  // Anti-IDOR Layer 2: Blokir manipulasi parameter identitas & HPP pada API
+  if (isApiRoute && user && hasIdorQueryTampering(request, user.id)) {
+    recordStrike(getClientIp(request));
+    return blockedResponse(403, "Forbidden: Identity mismatch", true);
+  }
+
+  // Redirect halaman terproteksi ke /login bila belum login
   if (!user && !isPublicAuthPage && !isAuthCallback && !isApiRoute) {
-    const loginUrl = new URL("/login", request.url);
+    const loginUrl = buildRedirectUrl(request, "/login");
     const safeRedirect =
-      pathname.startsWith("/") && !pathname.startsWith("//") ? pathname : "/";
+      pathname.startsWith("/") && !pathname.startsWith("//") && !pathname.includes("\\")
+        ? pathname
+        : "/";
     loginUrl.searchParams.set("redirect", safeRedirect);
+
     const redirectRes = NextResponse.redirect(loginUrl);
     if (shouldClearStaleCookies) {
       clearStaleSupabaseCookies(request, redirectRes);
@@ -317,12 +461,30 @@ export async function middleware(request: NextRequest) {
     return applySecurityHeaders(redirectRes);
   }
 
+  // Redirect user yang sudah login keluar dari halaman /login & /register
   if (user && isPublicAuthPage) {
-    return applySecurityHeaders(NextResponse.redirect(new URL("/", request.url)));
+    const redirectRes = NextResponse.redirect(buildRedirectUrl(request, "/"));
+    pendingCookies.forEach(({ name, value, options }) => {
+      redirectRes.cookies.set(name, value, options);
+    });
+    return applySecurityHeaders(redirectRes);
   }
+
+  // Teruskan request dengan header bersih + x-verified-user-id dari server
+  const response = NextResponse.next({
+    request: { headers: buildForwardHeaders(request, user) }
+  });
+
+  pendingCookies.forEach(({ name, value, options }) => {
+    response.cookies.set(name, value, options);
+  });
 
   if (shouldClearStaleCookies) {
     clearStaleSupabaseCookies(request, response);
+  }
+
+  if (isApiRoute) {
+    response.headers.set("Cache-Control", "no-store, private");
   }
 
   return applySecurityHeaders(response);
@@ -330,6 +492,6 @@ export async function middleware(request: NextRequest) {
 
 export const config = {
   matcher: [
-    "/((?!api/health|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)"
+    "/((?!api/health|_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml|manifest.json|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico|woff|woff2|ttf|otf)$).*)"
   ]
 };
