@@ -18,6 +18,11 @@ import { VideoEffectProcessor, type VideoEffectId } from "@/utils/videoEffects";
 
 const CUSTOM_BG_STORAGE_KEY = "ramameet_custom_bg";
 const MAX_BG_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+const HD_VOICE_BITRATE = 48_000;
+const MESH_OPUS_MAX_BITRATE = 64_000;
+const ALLOWED_BG_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const SAFE_BG_DATA_URL_PATTERN = /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i;
+const SAFE_MEETING_CODE_PATTERN = /^[a-z0-9_-]{3,64}$/;
 
 interface UseLiveKitRoomOptions {
   meetingCode: string;
@@ -58,7 +63,17 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.cloudflare.com:3478" }
 ];
 
+// Constraint audio jernih HD Voice 48kHz mono + peredam gema & bising aktif
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  channelCount: { ideal: 1 },
+  sampleRate: { ideal: 48000 },
+  sampleSize: { ideal: 16 }
+};
+
+const AUDIO_FALLBACK_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: true,
   autoGainControl: true
@@ -73,6 +88,109 @@ const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
 
 let sharedAudioCtx: AudioContext | null = null;
 let pendingJoinSound = false;
+
+function sanitizeAvatarUrl(url?: string | null): string | null {
+  if (!url || typeof url !== "string") return null;
+  const trimmed = url.trim();
+  if (
+    trimmed.startsWith("https://") ||
+    trimmed.startsWith("http://") ||
+    trimmed.startsWith("/")
+  ) {
+    return trimmed.slice(0, 512);
+  }
+  return null;
+}
+
+function sanitizeDisplayName(name?: string | null, fallback = "Peserta"): string {
+  if (!name || typeof name !== "string") return fallback;
+  const cleaned = name.replace(/[\u0000-\u001F\u007F]/g, "").trim();
+  return cleaned ? cleaned.slice(0, 80) : fallback;
+}
+
+function applySpeechHint(track: MediaStreamTrack | null) {
+  if (!track || track.kind !== "audio") return;
+  try {
+    (track as MediaStreamTrack & { contentHint?: string }).contentHint = "speech";
+  } catch {
+    // Abaikan jika browser tidak mendukung contentHint audio
+  }
+}
+
+// Optimasi codec Opus di WebRTC Mesh: In-Band FEC (anti putus-putus), DTX (anti desis), HD bitrate
+function optimizeOpusSdp(sdp?: string): string {
+  if (!sdp) return "";
+  const lines = sdp.split("\r\n");
+  let opusPayload: string | null = null;
+
+  for (const line of lines) {
+    const match = line.match(/^a=rtpmap:(\d+)\s+opus\/48000\/2/i);
+    if (match) {
+      opusPayload = match[1];
+      break;
+    }
+  }
+  if (!opusPayload) return sdp;
+
+  const desiredParams: Record<string, string> = {
+    minptime: "10",
+    useinbandfec: "1",
+    usedtx: "1",
+    maxaveragebitrate: String(MESH_OPUS_MAX_BITRATE),
+    stereo: "0",
+    "sprop-stereo": "0"
+  };
+
+  const fmtpPrefix = `a=fmtp:${opusPayload} `;
+  let foundFmtp = false;
+
+  const updated = lines.map((line) => {
+    if (!line.startsWith(fmtpPrefix)) return line;
+    foundFmtp = true;
+    const rawParams = line.slice(fmtpPrefix.length).trim();
+    const map = new Map<string, string>();
+
+    rawParams.split(";").forEach((pair) => {
+      const trimmed = pair.trim();
+      if (!trimmed) return;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx > 0) {
+        map.set(trimmed.slice(0, eqIdx).trim(), trimmed.slice(eqIdx + 1).trim());
+      }
+    });
+
+    Object.entries(desiredParams).forEach(([k, v]) => map.set(k, v));
+    const serialized = Array.from(map.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join(";");
+    return `${fmtpPrefix}${serialized}`;
+  });
+
+  if (!foundFmtp) {
+    const rtpmapIndex = updated.findIndex((l) => l.startsWith(`a=rtpmap:${opusPayload} `));
+    if (rtpmapIndex !== -1) {
+      const serialized = Object.entries(desiredParams)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(";");
+      updated.splice(rtpmapIndex + 1, 0, `${fmtpPrefix}${serialized}`);
+    }
+  }
+
+  return updated.join("\r\n");
+}
+
+async function tuneAudioSender(sender: RTCRtpSender) {
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    params.encodings[0].maxBitrate = MESH_OPUS_MAX_BITRATE;
+    await sender.setParameters(params);
+  } catch {
+    // Beberapa browser mobile membatasi setParameters sebelum negosiasi selesai
+  }
+}
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -123,16 +241,21 @@ function scheduleTone(
 ) {
   const now = ctx.currentTime + startOffset;
   const osc = ctx.createOscillator();
+  const filter = ctx.createBiquadFilter();
   const gain = ctx.createGain();
 
   osc.type = type;
   osc.frequency.setValueAtTime(freq, now);
 
+  filter.type = "lowpass";
+  filter.frequency.setValueAtTime(2400, now);
+
   gain.gain.setValueAtTime(0.0001, now);
-  gain.gain.linearRampToValueAtTime(peakGain, now + 0.015);
+  gain.gain.linearRampToValueAtTime(peakGain, now + 0.02);
   gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
 
-  osc.connect(gain);
+  osc.connect(filter);
+  filter.connect(gain);
   gain.connect(ctx.destination);
 
   osc.start(now);
@@ -146,16 +269,16 @@ function playMeetingSound(kind: MeetingSoundKind) {
   const trigger = () => {
     try {
       if (kind === "join") {
-        scheduleTone(ctx, 523.25, 0, 0.24, 0.32, "sine");
-        scheduleTone(ctx, 659.25, 0.09, 0.28, 0.3, "sine");
-        scheduleTone(ctx, 783.99, 0.19, 0.38, 0.28, "triangle");
+        scheduleTone(ctx, 523.25, 0, 0.24, 0.28, "sine");
+        scheduleTone(ctx, 659.25, 0.09, 0.28, 0.26, "sine");
+        scheduleTone(ctx, 783.99, 0.19, 0.38, 0.24, "triangle");
       } else if (kind === "leave") {
-        scheduleTone(ctx, 659.25, 0, 0.2, 0.26, "sine");
-        scheduleTone(ctx, 440.0, 0.12, 0.3, 0.24, "sine");
+        scheduleTone(ctx, 659.25, 0, 0.2, 0.24, "sine");
+        scheduleTone(ctx, 440.0, 0.12, 0.3, 0.22, "sine");
       } else if (kind === "toggle-on") {
-        scheduleTone(ctx, 680, 0, 0.085, 0.14, "sine");
+        scheduleTone(ctx, 680, 0, 0.085, 0.12, "sine");
       } else {
-        scheduleTone(ctx, 420, 0, 0.085, 0.14, "sine");
+        scheduleTone(ctx, 420, 0, 0.085, 0.12, "sine");
       }
     } catch {
       // Ignore Web Audio errors
@@ -240,8 +363,11 @@ class MeshSession {
         this.localMediaStream?.removeTrack(t);
       }
     });
-    if (nextTrack && !this.localMediaStream.getAudioTracks().includes(nextTrack)) {
-      this.localMediaStream.addTrack(nextTrack);
+    if (nextTrack) {
+      applySpeechHint(nextTrack);
+      if (!this.localMediaStream.getAudioTracks().includes(nextTrack)) {
+        this.localMediaStream.addTrack(nextTrack);
+      }
     }
   }
 
@@ -386,6 +512,10 @@ export function useLiveKitRoom({
   enabled
 }: UseLiveKitRoomOptions) {
   const normalizedCode = useMemo(() => meetingCode.trim().toLowerCase(), [meetingCode]);
+  const isValidRoomCode = useMemo(
+    () => SAFE_MEETING_CODE_PATTERN.test(normalizedCode),
+    [normalizedCode]
+  );
   const localPeerId = useMemo(() => getClientPeerId(userId), [userId]);
   const sessionKey = `${normalizedCode}:${localPeerId}`;
 
@@ -413,10 +543,12 @@ export function useLiveKitRoom({
     if (typeof window === "undefined") return;
     try {
       const saved = window.localStorage.getItem(CUSTOM_BG_STORAGE_KEY);
-      if (saved) {
+      if (saved && SAFE_BG_DATA_URL_PATTERN.test(saved)) {
         const session = getSession(sessionKey);
         session.customBackgroundUrl = saved;
         setCustomBackgroundUrl(saved);
+      } else if (saved) {
+        window.localStorage.removeItem(CUSTOM_BG_STORAGE_KEY);
       }
     } catch {
       // Ignore storage access errors
@@ -478,6 +610,7 @@ export function useLiveKitRoom({
         attempts.push({ audio: { ...AUDIO_CONSTRAINTS, deviceId: { ideal: deviceId } } });
       }
       attempts.push({ audio: AUDIO_CONSTRAINTS });
+      attempts.push({ audio: AUDIO_FALLBACK_CONSTRAINTS });
       attempts.push({ audio: true });
 
       for (const constraints of attempts) {
@@ -486,6 +619,7 @@ export function useLiveKitRoom({
           const track = stream.getAudioTracks()[0] || null;
           if (track) {
             track.enabled = true;
+            applySpeechHint(track);
             return track;
           }
         } catch {
@@ -617,8 +751,8 @@ export function useLiveKitRoom({
 
       return {
         identity: p.identity,
-        name: p.name || p.identity,
-        avatarUrl: local ? avatarUrl : meta.avatarUrl || null,
+        name: sanitizeDisplayName(p.name, p.identity),
+        avatarUrl: local ? sanitizeAvatarUrl(avatarUrl) : sanitizeAvatarUrl(meta.avatarUrl),
         isLocal: local,
         isHost: local ? isHost : Boolean(meta.isHost),
         isMuted: mutedState,
@@ -729,7 +863,18 @@ export function useLiveKitRoom({
             transceiver.direction = "sendrecv";
           }
           if (transceiver.sender.track !== nextTrack) {
-            tasks.push(transceiver.sender.replaceTrack(nextTrack).catch(() => {}));
+            tasks.push(
+              transceiver.sender
+                .replaceTrack(nextTrack)
+                .then(() => {
+                  if (role === "audio" && nextTrack) {
+                    return tuneAudioSender(transceiver.sender);
+                  }
+                })
+                .catch(() => {})
+            );
+          } else if (role === "audio" && nextTrack) {
+            tasks.push(tuneAudioSender(transceiver.sender));
           }
         }
       }
@@ -784,6 +929,7 @@ export function useLiveKitRoom({
           });
           stream.getAudioTracks().forEach((t) => {
             t.enabled = !session.desiredMuted;
+            applySpeechHint(t);
           });
           stream.getVideoTracks().forEach((t) => {
             t.enabled = !session.desiredVideoOff;
@@ -958,7 +1104,7 @@ export function useLiveKitRoom({
   // Upload & langsung terapkan background gambar custom
   const uploadBackgroundImage = useCallback(
     async (file: File) => {
-      if (!file.type.startsWith("image/")) {
+      if (!ALLOWED_BG_MIME_TYPES.has(file.type)) {
         pushNotification({
           title: "Format File Tidak Didukung",
           message: "Pilih file gambar dengan format PNG, JPG, atau WEBP.",
@@ -993,11 +1139,13 @@ export function useLiveKitRoom({
         session.effectProcessor?.setCustomBackground(dataUrl);
         await setCameraEffect("custom");
 
-        pushNotification({
-          title: "Background Terpasang",
-          message: "Foto background berhasil di-upload dan diterapkan ke kamera.",
-          type: "success"
-        });
+        if (session.cameraEffect === "custom") {
+          pushNotification({
+            title: "Background Terpasang",
+            message: "Foto background berhasil di-upload dan diterapkan ke kamera.",
+            type: "success"
+          });
+        }
       } catch {
         pushNotification({
           title: "Upload Gagal",
@@ -1058,7 +1206,7 @@ export function useLiveKitRoom({
 
   // Langsung buka kamera & preview lokal sejak awal
   useEffect(() => {
-    if (!normalizedCode || !userId) return;
+    if (!isValidRoomCode || !userId) return;
     let unmounted = false;
     const session = getSession(sessionKey);
 
@@ -1085,7 +1233,7 @@ export function useLiveKitRoom({
       session.cleanupAll(localPeerId);
       sessions.delete(sessionKey);
     };
-  }, [localPeerId, normalizedCode, sessionKey, userId]);
+  }, [isValidRoomCode, localPeerId, sessionKey, userId]);
 
   useEffect(() => {
     const session = getSession(sessionKey);
@@ -1098,7 +1246,7 @@ export function useLiveKitRoom({
   }, [avatarUrl, broadcastMeshState, isHost, sessionKey, syncLiveKitTiles, syncMeshTiles, userName]);
 
   useEffect(() => {
-    if (!enabled || !normalizedCode) return;
+    if (!enabled || !isValidRoomCode) return;
     let cancelled = false;
     const session = getSession(sessionKey);
 
@@ -1127,7 +1275,9 @@ export function useLiveKitRoom({
         audioT.direction = "sendrecv";
         if (audioTrack) {
           audioTrack.enabled = !session.isMuted;
+          applySpeechHint(audioTrack);
           await audioT.sender.replaceTrack(audioTrack).catch(() => {});
+          await tuneAudioSender(audioT.sender);
         }
       }
       if (camT) {
@@ -1219,7 +1369,10 @@ export function useLiveKitRoom({
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+        if (pc.connectionState === "connected") {
+          const audioT = getTransceiverByRole(pc, "audio");
+          if (audioT?.sender) void tuneAudioSender(audioT.sender);
+        } else if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           session.peerConnections.delete(peerId);
           session.remoteTracks.delete(peerId);
           callbacksRef.current.syncMeshTiles();
@@ -1250,7 +1403,11 @@ export function useLiveKitRoom({
       try {
         await attachLocalTracksToTransceivers(pc);
         const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        const tunedOffer: RTCSessionDescriptionInit = {
+          type: offer.type,
+          sdp: optimizeOpusSdp(offer.sdp)
+        };
+        await pc.setLocalDescription(tunedOffer);
         await session.channel.send({
           type: "broadcast",
           event: "webrtc-signal",
@@ -1258,7 +1415,7 @@ export function useLiveKitRoom({
             to: peerId,
             from: localPeerId,
             kind: "offer",
-            sdp: offer
+            sdp: tunedOffer
           }
         });
       } catch {
@@ -1271,7 +1428,12 @@ export function useLiveKitRoom({
       if (!peerId || peerId === localPeerId) return;
 
       const isNewPeer = !session.knownRemotePeers.has(peerId);
-      session.peerMeta.set(peerId, { ...meta, peerId });
+      session.peerMeta.set(peerId, {
+        ...meta,
+        peerId,
+        name: sanitizeDisplayName(meta.name, "Peserta"),
+        avatarUrl: sanitizeAvatarUrl(meta.avatarUrl)
+      });
       session.peerLastSeen.set(peerId, Date.now());
       session.knownRemotePeers.add(peerId);
 
@@ -1422,7 +1584,11 @@ export function useLiveKitRoom({
               session.pendingIce.delete(fromId);
 
               const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
+              const tunedAnswer: RTCSessionDescriptionInit = {
+                type: answer.type,
+                sdp: optimizeOpusSdp(answer.sdp)
+              };
+              await pc.setLocalDescription(tunedAnswer);
               await channel.send({
                 type: "broadcast",
                 event: "webrtc-signal",
@@ -1430,7 +1596,7 @@ export function useLiveKitRoom({
                   to: fromId,
                   from: localPeerId,
                   kind: "answer",
-                  sdp: answer
+                  sdp: tunedAnswer
                 }
               });
             } catch {
@@ -1503,7 +1669,7 @@ export function useLiveKitRoom({
 
       if (!token || !serverUrl) {
         await startMultiUserMeshFallback(
-          "Mode Multi-User WebRTC Mesh aktif (Kamera + Suara + Share Screen simultan)."
+          "Mode Multi-User WebRTC Mesh aktif (Kamera + Suara HD + Share Screen simultan)."
         );
         return;
       }
@@ -1516,7 +1682,10 @@ export function useLiveKitRoom({
           resolution: { width: 1280, height: 720, frameRate: 30 }
         },
         publishDefaults: {
-          simulcast: true
+          simulcast: true,
+          dtx: true,
+          red: true,
+          audioPreset: { maxBitrate: HD_VOICE_BITRATE }
         }
       });
       session.room = room;
@@ -1598,8 +1767,14 @@ export function useLiveKitRoom({
 
         if (existingAudio) {
           existingAudio.enabled = !session.isMuted;
+          applySpeechHint(existingAudio);
           const micPub = await room.localParticipant
-            .publishTrack(existingAudio, { source: Track.Source.Microphone })
+            .publishTrack(existingAudio, {
+              source: Track.Source.Microphone,
+              dtx: true,
+              red: true,
+              audioPreset: { maxBitrate: HD_VOICE_BITRATE }
+            })
             .catch(() => null);
           if (session.isMuted && micPub?.track) {
             await micPub.track.mute().catch(() => {});
@@ -1650,7 +1825,7 @@ export function useLiveKitRoom({
       cancelled = true;
       session.cleanupTransport(localPeerId);
     };
-  }, [enabled, localPeerId, normalizedCode, token, serverUrl, sessionKey]);
+  }, [enabled, isValidRoomCode, localPeerId, normalizedCode, token, serverUrl, sessionKey]);
 
   const syncDesiredMicState = useCallback(async () => {
     const session = getSession(sessionKey);
@@ -1709,6 +1884,7 @@ export function useLiveKitRoom({
           }
 
           audioTrack.enabled = true;
+          applySpeechHint(audioTrack);
 
           if (session.room) {
             const micPub = session.room.localParticipant.getTrackPublication(
@@ -1728,7 +1904,12 @@ export function useLiveKitRoom({
                 ).catch(() => {});
               }
               await session.room.localParticipant
-                .publishTrack(audioTrack, { source: Track.Source.Microphone })
+                .publishTrack(audioTrack, {
+                  source: Track.Source.Microphone,
+                  dtx: true,
+                  red: true,
+                  audioPreset: { maxBitrate: HD_VOICE_BITRATE }
+                })
                 .catch(() => {});
             }
             syncLiveKitTiles();
@@ -2230,7 +2411,12 @@ export function useLiveKitRoom({
           ).catch(() => {});
         }
         const published = await session.room.localParticipant
-          .publishTrack(newTrack, { source: Track.Source.Microphone })
+          .publishTrack(newTrack, {
+            source: Track.Source.Microphone,
+            dtx: true,
+            red: true,
+            audioPreset: { maxBitrate: HD_VOICE_BITRATE }
+          })
           .catch(() => null);
         if (session.isMuted && published?.track) {
           await published.track.mute().catch(() => {});

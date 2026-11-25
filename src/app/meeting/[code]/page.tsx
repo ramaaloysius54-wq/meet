@@ -407,6 +407,7 @@ export default function MeetingRoomPage() {
             isScreenSharing={lk.isScreenSharing}
             isScreenPaused={lk.isScreenPaused}
             cameraEffect={lk.cameraEffect}
+            customBackgroundUrl={lk.customBackgroundUrl}
             micBusy={lk.micBusy}
             camBusy={lk.camBusy}
             isLocked={Boolean(meeting?.is_locked)}
@@ -422,6 +423,8 @@ export default function MeetingRoomPage() {
             onToggleScreenShare={lk.toggleScreenShare}
             onTogglePauseScreenShare={lk.togglePauseScreenShare}
             onChangeCameraEffect={lk.setCameraEffect}
+            onUploadBackgroundImage={lk.uploadBackgroundImage}
+            onClearCustomBackground={lk.clearCustomBackground}
             onSelectAudio={lk.switchAudioDevice}
             onSelectVideo={lk.switchVideoDevice}
             onOpenParticipants={() => {

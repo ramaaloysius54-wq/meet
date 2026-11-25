@@ -1,22 +1,29 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi
+RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi \
+  && npm cache clean --force
 
 FROM node:22-alpine AS signaling-builder
 WORKDIR /signaling
 COPY server/package.json server/package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi
 COPY server/ ./
-RUN npm run build && npm prune --omit=dev
+RUN rm -rf .env .env.* .git \
+  && npm run build \
+  && npm prune --omit=dev \
+  && npm cache clean --force
 
 FROM node:22-alpine AS web-builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN mkdir -p public
 
-# Nilai default public env (aman di Dockerfile karena memang diekspos ke browser)
+# Hapus paksa seluruh file sensitif agar tidak pernah ikut ter-build atau tersalin ke public/standalone
+RUN mkdir -p public \
+  && rm -rf .env .env.* .git .github k8s public/.* public/*.env*
+
+# Public client config (hanya variabel NEXT_PUBLIC_ yang aman untuk browser)
 ARG NEXT_PUBLIC_SUPABASE_URL=https://wqqdtmkviwwespovlkrk.supabase.co
 ARG NEXT_PUBLIC_SUPABASE_ANON_KEY=sb_publishable_c_G3Op4Uscj1sgamc3vNPg_MvVqDsfM
 ARG NEXT_PUBLIC_LIVEKIT_URL=wss://meet.portofoliorama.my.id
@@ -37,17 +44,22 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV HOSTNAME="0.0.0.0"
 ENV PORT=3000
 
-RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
+RUN addgroup --system --gid 1001 nodejs \
+  && adduser --system --uid 1001 nextjs
 
 # Next.js standalone output
 COPY --from=web-builder --chown=nextjs:nodejs /app/public ./public
 COPY --from=web-builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=web-builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
-# Socket.IO signaling output (dijalankan oleh deployment signaling via override command)
+# Socket.IO signaling output
 COPY --from=signaling-builder --chown=nextjs:nodejs /signaling/package.json ./signaling/package.json
 COPY --from=signaling-builder --chown=nextjs:nodejs /signaling/node_modules ./signaling/node_modules
 COPY --from=signaling-builder --chown=nextjs:nodejs /signaling/dist ./signaling/dist
+
+# Verifikasi terakhir: pastikan 0 file .env atau source map (.map) di image produksi
+RUN find /app -maxdepth 3 \( -name ".env*" -o -name "*.pem" -o -name "*.key" \) -delete \
+  && find /app/.next -name "*.map" -delete 2>/dev/null || true
 
 USER nextjs
 EXPOSE 3000 4000

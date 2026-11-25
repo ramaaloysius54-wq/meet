@@ -43,10 +43,10 @@ export function MeetingCard({ meeting, onDeleted }: MeetingCardProps) {
         message: `"${meeting.title}" berhasil dihapus dari daftar.`,
         type: "success"
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
       pushNotification({
         title: "Gagal Menghapus",
-        message: err.message || "Tidak dapat menghapus meeting",
+        message: err instanceof Error ? err.message : "Tidak dapat menghapus meeting",
         type: "error"
       });
     } finally {
@@ -56,41 +56,41 @@ export function MeetingCard({ meeting, onDeleted }: MeetingCardProps) {
 
   return (
     <>
-      <div className="flex flex-col justify-between gap-4 rounded-2xl border border-rm-border/70 bg-rm-sidebar/90 p-4 transition hover:border-rm-primary/60">
+      <div className="flex flex-col justify-between gap-4 rounded-3xl border border-blue-400/15 bg-[#0C1733]/85 p-4 shadow-panel backdrop-blur-xl transition hover:border-blue-400/40">
         <div>
-          <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="mb-2.5 flex items-center justify-between gap-2">
             <span
               className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${
                 meeting.status === "live"
-                  ? "bg-rm-success/15 text-rm-success"
+                  ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-400/30"
                   : meeting.status === "scheduled"
-                    ? "bg-rm-primary/15 text-sky-400"
-                    : "bg-rm-surface text-rm-muted"
+                  ? "bg-blue-500/15 text-sky-300 ring-1 ring-blue-400/30"
+                  : "bg-slate-800/80 text-rm-muted"
               }`}
             >
               {meeting.status === "live" && (
-                <span className="h-1.5 w-1.5 rounded-full bg-rm-success animate-pulse" />
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
               )}
               {meeting.status.toUpperCase()}
             </span>
 
             {meeting.has_password && (
-              <span className="inline-flex items-center gap-1 text-xs text-rm-muted">
+              <span className="inline-flex items-center gap-1 text-xs text-amber-300">
                 <Lock className="h-3.5 w-3.5" /> Protected
               </span>
             )}
           </div>
 
-          <h4 className="truncate text-base font-semibold text-rm-text">{meeting.title}</h4>
-          <p className="mt-1 text-xs text-rm-muted">ID: {meeting.meeting_code}</p>
+          <h4 className="truncate text-base font-bold text-white">{meeting.title}</h4>
+          <p className="mt-1 font-mono text-xs text-rm-muted">ID: {meeting.meeting_code}</p>
 
-          <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-rm-muted">
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-blue-200/75">
             <span className="inline-flex items-center gap-1">
-              <Calendar className="h-3.5 w-3.5" />
+              <Calendar className="h-3.5 w-3.5 text-[#38BDF8]" />
               {new Date(meeting.scheduled_at || meeting.created_at).toLocaleDateString("id-ID")}
             </span>
             <span className="inline-flex items-center gap-1">
-              <Clock className="h-3.5 w-3.5" />
+              <Clock className="h-3.5 w-3.5 text-[#38BDF8]" />
               {new Date(meeting.scheduled_at || meeting.created_at).toLocaleTimeString("id-ID", {
                 hour: "2-digit",
                 minute: "2-digit"
@@ -102,15 +102,15 @@ export function MeetingCard({ meeting, onDeleted }: MeetingCardProps) {
         <div className="flex items-center gap-2">
           <Link
             href={`/meeting/${meeting.meeting_code}`}
-            className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-rm-primary px-3 py-2 text-xs font-semibold text-white transition hover:bg-rm-secondary"
+            className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-gradient-to-r from-[#2589FF] to-[#1668E8] px-3 py-2 text-xs font-semibold text-white shadow-[0_0_14px_rgba(37,137,255,0.4)] transition hover:brightness-110"
           >
             <Video className="h-3.5 w-3.5" />
-            <span>{meeting.status === "ended" ? "Lihat Detail" : "Join Meeting"}</span>
+            <span>{meeting.status === "ended" ? "Open" : "Join Meeting"}</span>
           </Link>
           <button
             type="button"
             onClick={copyInvite}
-            className="flex h-9 w-9 items-center justify-center rounded-xl border border-rm-border bg-rm-surface text-rm-muted transition hover:text-white"
+            className="flex h-9 w-9 items-center justify-center rounded-xl border border-blue-400/15 bg-[#111E3E] text-blue-200/75 transition hover:text-white"
             title="Salin Link Undangan"
           >
             <Copy className="h-4 w-4" />
@@ -119,7 +119,7 @@ export function MeetingCard({ meeting, onDeleted }: MeetingCardProps) {
             <button
               type="button"
               onClick={() => setConfirmOpen(true)}
-              className="flex h-9 w-9 items-center justify-center rounded-xl border border-rm-border bg-rm-surface text-rm-muted transition hover:border-rm-danger/60 hover:bg-rm-danger/15 hover:text-rm-danger"
+              className="flex h-9 w-9 items-center justify-center rounded-xl border border-blue-400/15 bg-[#111E3E] text-blue-200/75 transition hover:border-red-500/60 hover:bg-red-500/15 hover:text-red-400"
               title="Hapus Meeting"
             >
               <Trash2 className="h-4 w-4" />
