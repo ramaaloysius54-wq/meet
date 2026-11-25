@@ -245,13 +245,6 @@ function runSecurityWaf(request: NextRequest): NextResponse | null {
 
 // --- 2. MIDDLEWARE UTAMA ---
 export async function middleware(request: NextRequest) {
-  const pathname = request.nextUrl.pathname;
-
-  // Bypass cepat untuk Kubernetes Readiness/Liveness Probe
-  if (pathname === "/api/health") {
-    return NextResponse.json({ status: "ok" }, { status: 200 });
-  }
-
   const securityBlock = runSecurityWaf(request);
   if (securityBlock) return securityBlock;
 
@@ -307,6 +300,7 @@ export async function middleware(request: NextRequest) {
     }
   }
 
+  const pathname = request.nextUrl.pathname;
   const isPublicAuthPage = pathname.startsWith("/login") || pathname.startsWith("/register");
   const isAuthCallback = pathname.startsWith("/auth");
   const isApiRoute = pathname.startsWith("/api");
@@ -335,5 +329,7 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)"]
+  matcher: [
+    "/((?!api/health|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)"
+  ]
 };

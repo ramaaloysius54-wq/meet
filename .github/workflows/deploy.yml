@@ -127,14 +127,14 @@ jobs:
               ! -path "*/argocd/*" ! -name "project.yaml" ! -name "application.yaml" ! -name "*namespace*.yaml" \
               -exec kubectl apply -n default -f {} \;
 
-            # 5. Rollout aman di namespace default + paksa imagePullPolicy Always
+            # 5. Rollout aman dengan strategic patch (tidak menghapus ports/envFrom/probes/command)
             rollout_check() {
               local DEPLOY="$1"
               if kubectl get deployment "$DEPLOY" -n default >/dev/null 2>&1; then
                 local CONTAINER_NAME
                 CONTAINER_NAME=$(kubectl get deployment "$DEPLOY" -n default -o jsonpath='{.spec.template.spec.containers[0].name}')
 
-                kubectl patch deployment "$DEPLOY" -n default --type merge -p "{
+                kubectl patch deployment "$DEPLOY" -n default --type strategic -p "{
                   \"spec\": {
                     \"strategy\": {
                       \"type\": \"RollingUpdate\",
@@ -158,6 +158,8 @@ jobs:
                 if ! kubectl rollout status deployment/"$DEPLOY" -n default --timeout=180s; then
                   echo "=== ROLLOUT $DEPLOY GAGAL - STATUS POD ==="
                   kubectl get pods -n default -l app="$DEPLOY" -o wide || kubectl get pods -n default -o wide
+                  echo "=== DESCRIBE PODS $DEPLOY ==="
+                  kubectl describe pods -n default -l app="$DEPLOY" | tail -n 40 || true
                   echo "=== EVENTS TERBARU ==="
                   kubectl get events -n default --sort-by='.lastTimestamp' | tail -n 20
                   echo "=== LOGS CONTAINER ==="
