@@ -21,7 +21,8 @@ COPY . .
 
 # Hapus paksa seluruh file sensitif agar tidak pernah ikut ter-build atau tersalin ke public/standalone
 RUN mkdir -p public \
-  && rm -rf .env .env.* .git .github k8s public/.* public/*.env*
+  && rm -rf .env .env.* .git .github k8s \
+  && find public -mindepth 1 -maxdepth 3 \( -name ".*" -o -name "*.env*" \) -prune -exec rm -rf {} +
 
 # Public client config (hanya variabel NEXT_PUBLIC_ yang aman untuk browser)
 ARG NEXT_PUBLIC_SUPABASE_URL=https://wqqdtmkviwwespovlkrk.supabase.co
@@ -58,8 +59,8 @@ COPY --from=signaling-builder --chown=nextjs:nodejs /signaling/node_modules ./si
 COPY --from=signaling-builder --chown=nextjs:nodejs /signaling/dist ./signaling/dist
 
 # Verifikasi terakhir: pastikan 0 file .env atau source map (.map) di image produksi
-RUN find /app -maxdepth 3 \( -name ".env*" -o -name "*.pem" -o -name "*.key" \) -delete \
-  && find /app/.next -name "*.map" -delete 2>/dev/null || true
+RUN find /app -maxdepth 3 -type f \( -name ".env*" -o -name "*.pem" -o -name "*.key" \) -delete \
+  && find /app/.next -type f -name "*.map" -delete 2>/dev/null || true
 
 USER nextjs
 EXPOSE 3000 4000
