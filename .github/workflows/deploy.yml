@@ -10,14 +10,14 @@ permissions:
 
 jobs:
   build-and-deploy:
-    name: Build Docker Hub & Deploy RamaMeet (VPS + K3s + ArgoCD)
+    name: Build Docker Hub & Sync ArgoCD (K3s)
     runs-on: ubuntu-latest
 
     steps:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐳 Set Lowercase Docker Hub Image Name
+      - name: 🔍 Validasi Manifest k8s & Secret Docker Hub
         id: meta
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -27,6 +27,12 @@ jobs:
             echo "❌ Secret DOCKERHUB_USERNAME atau DOCKERHUB_TOKEN belum diisi di GitHub Secrets!"
             exit 1
           fi
+
+          if grep -rnE "USERNAME_DOCKERHUB|ghcr\.io|ghcr-secret" k8s/; then
+            echo "❌ Masih ada placeholder USERNAME_DOCKERHUB atau sisa GHCR di folder k8s/! Ganti dulu dengan Docker ID huruf kecil kamu."
+            exit 1
+          fi
+
           DOCKER_USER=$(echo "$DOCKERHUB_USERNAME" | tr '[:upper:]' '[:lower:]')
           echo "docker_user=${DOCKER_USER}" >> "$GITHUB_OUTPUT"
           echo "image_repo=${DOCKER_USER}/ramameet" >> "$GITHUB_OUTPUT"
@@ -52,48 +58,35 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: 🚀 Sync Manifests & Files ke VPS (/var/www/ramameet)
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          SSHPASS: ${{ secrets.VPS_PASSWORD }}
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass rsync
-
-          echo "1. Pastikan direktori target ada di VPS..."
-          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" \
-            "mkdir -p /var/www/ramameet"
-
-          echo "2. Mengirim file terbaru ke VPS..."
-          sshpass -e rsync -avz --delete \
-            --exclude='.git' \
-            --exclude='node_modules' \
-            --exclude='server/node_modules' \
-            --exclude='.next' \
-            --exclude='.env' \
-            --exclude='.env.*' \
-            -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22" \
-            ./ "$VPS_USER@$VPS_HOST:/var/www/ramameet/"
-
-      - name: ☸️ Sync ArgoCD & Rollout Pods K3s (Namespace default)
+      - name: ☸️ Sync ArgoCD & Rollout Pods K3s
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
           DOCKER_USER: ${{ steps.meta.outputs.docker_user }}
           DOCKER_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          FULL_IMAGE: ${{ steps.meta.outputs.image_repo }}:latest
+          GIT_SHA: ${{ github.sha }}
         run: |
-          echo "3. Sinkronisasi ArgoCD & Rollout K3s di namespace default..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass rsync
+
+          echo "1. Sync hanya manifest ArgoCD (project.yaml & application.yaml)..."
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" \
+            "mkdir -p /var/www/ramameet/k8s/argocd"
+
+          sshpass -e rsync -avz --delete \
+            -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22" \
+            ./k8s/argocd/ "$VPS_USER@$VPS_HOST:/var/www/ramameet/k8s/argocd/"
+
+          echo "2. Trigger ArgoCD Sync & Rollout pods..."
           sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 \
-            "$VPS_USER@$VPS_HOST" "bash -s -- '$DOCKER_USER' '$DOCKER_TOKEN' '$FULL_IMAGE'" << 'ENDK8S'
+            "$VPS_USER@$VPS_HOST" "bash -s -- '$DOCKER_USER' '$DOCKER_TOKEN' '$GIT_SHA'" << 'ENDK8S'
             set -euo pipefail
             DOCKER_USER="$1"
             DOCKER_TOKEN="$2"
-            FULL_IMAGE="$3"
+            GIT_SHA="$3"
             export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-            # 1. Pasang pull secret Docker Hub permanen ke ServiceAccount default
+            # 1. Pastikan pull secret Docker Hub selalu tersedia di namespace default
             kubectl create secret docker-registry dockerhub-secret \
               --namespace=default \
               --docker-server=https://index.docker.io/v1/ \
@@ -104,55 +97,28 @@ jobs:
             kubectl patch serviceaccount default -n default \
               -p '{"imagePullSecrets":[{"name":"dockerhub-secret"}]}' || true
 
-            # 2. Salin Secret env dari namespace ramameet lama ke default & bersihkan resource lama
-            if kubectl get namespace ramameet >/dev/null 2>&1; then
-              for SEC in $(kubectl get secrets -n ramameet -o jsonpath='{.items[?(@.type=="Opaque")].metadata.name}' 2>/dev/null || true); do
-                if ! kubectl get secret "$SEC" -n default >/dev/null 2>&1; then
-                  kubectl get secret "$SEC" -n ramameet -o yaml \
-                    | sed '/namespace:/d; /resourceVersion:/d; /uid:/d; /creationTimestamp:/d' \
-                    | kubectl apply -n default -f - || true
-                fi
-              done
-              kubectl delete ingress,deployment,service,hpa --all -n ramameet --ignore-not-found=true || true
-            fi
-
-            # 3. Apply Project & Application ArgoCD
+            # 2. Apply HANYA manifest ArgoCD (workload diurus penuh oleh ArgoCD dari Git)
             kubectl apply -f /var/www/ramameet/k8s/argocd/project.yaml
             kubectl apply -f /var/www/ramameet/k8s/argocd/application.yaml
+
+            # 3. Paksa ArgoCD refresh & tunggu sampai Synced dengan commit terbaru
             kubectl annotate application ramameet-prod -n argocd \
-              argocd.argoproj.io/refresh="hard" --overwrite || true
+              argocd.argoproj.io/refresh="hard" --overwrite
 
-            # 4. Apply langsung manifest workload ke namespace default
-            find /var/www/ramameet/k8s -maxdepth 2 -type f \( -name "*.yaml" -o -name "*.yml" \) \
-              ! -path "*/argocd/*" ! -name "project.yaml" ! -name "application.yaml" ! -name "*namespace*.yaml" \
-              -exec kubectl apply -n default -f {} \;
+            for i in $(seq 1 18); do
+              SYNC_STATUS=$(kubectl get application ramameet-prod -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+              SYNC_REV=$(kubectl get application ramameet-prod -n argocd -o jsonpath='{.status.sync.revision}' 2>/dev/null || echo "")
+              echo "ArgoCD [$i/18] status=$SYNC_STATUS rev=${SYNC_REV:0:7} target=${GIT_SHA:0:7}"
+              if [ "$SYNC_STATUS" = "Synced" ] && [ "$SYNC_REV" = "$GIT_SHA" ]; then
+                break
+              fi
+              sleep 5
+            done
 
-            # 5. Rollout aman dengan strategic patch (tidak menghapus ports/envFrom/probes/command)
+            # 4. Restart rollout agar K3s menarik image :latest yang baru di-push
             rollout_check() {
               local DEPLOY="$1"
               if kubectl get deployment "$DEPLOY" -n default >/dev/null 2>&1; then
-                local CONTAINER_NAME
-                CONTAINER_NAME=$(kubectl get deployment "$DEPLOY" -n default -o jsonpath='{.spec.template.spec.containers[0].name}')
-
-                kubectl patch deployment "$DEPLOY" -n default --type strategic -p "{
-                  \"spec\": {
-                    \"strategy\": {
-                      \"type\": \"RollingUpdate\",
-                      \"rollingUpdate\": {\"maxSurge\": 0, \"maxUnavailable\": 1}
-                    },
-                    \"template\": {
-                      \"spec\": {
-                        \"imagePullSecrets\": [{\"name\": \"dockerhub-secret\"}],
-                        \"containers\": [{
-                          \"name\": \"${CONTAINER_NAME}\",
-                          \"image\": \"${FULL_IMAGE}\",
-                          \"imagePullPolicy\": \"Always\"
-                        }]
-                      }
-                    }
-                  }
-                }" || true
-
                 kubectl rollout restart deployment/"$DEPLOY" -n default
 
                 if ! kubectl rollout status deployment/"$DEPLOY" -n default --timeout=180s; then
@@ -172,7 +138,7 @@ jobs:
             rollout_check ramameet-web
             rollout_check ramameet-signaling
 
-            # 6. Status akhir ArgoCD & Pods di namespace default
-            kubectl get applications -n argocd || true
+            # 5. Status akhir ArgoCD & Pods
+            kubectl get applications -n argocd
             kubectl get pods -n default -o wide
           ENDK8S

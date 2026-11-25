@@ -21,10 +21,10 @@ spec:
         app: ramameet-signaling
     spec:
       imagePullSecrets:
-        - name: ghcr-secret
+        - name: dockerhub-secret
       containers:
         - name: signaling
-          image: ghcr.io/ramaaloysius54-wq/meet:latest
+          image: ramaaloysius54/ramameet:latest
           imagePullPolicy: Always
           command: ["node", "/app/signaling/dist/index.js"]
           ports:

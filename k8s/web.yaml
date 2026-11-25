@@ -25,7 +25,7 @@ spec:
         - name: dockerhub-secret
       containers:
         - name: web
-          image: USERNAME_DOCKERHUB/ramameet:latest
+          image: ramaaloysius54/ramameet:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000
