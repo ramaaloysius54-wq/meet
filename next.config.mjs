@@ -1,7 +1,11 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: "standalone",
   poweredByHeader: false,
   productionBrowserSourceMaps: false,
+  images: {
+    unoptimized: true
+  },
   async headers() {
     const csp = [
       "default-src 'self'",
